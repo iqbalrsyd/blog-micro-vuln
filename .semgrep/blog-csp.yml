@@ -1,0 +1,118 @@
+# Semgrep custom rules for blog security headers (Content-Security-Policy).
+# This file is enabled by scan_directives.py for detected_domain='blog'.
+
+rules:
+
+  # =========================================================================
+  # Content-Security-Policy and security headers
+  # =========================================================================
+
+  - id: blog-csp-missing
+    languages: [javascript, typescript, python]
+    severity: ERROR
+    message: >-
+      Response handler without Content-Security-Policy header. CSP
+      protects against XSS, clickjacking, and code injection. Set
+      CSP via helmet() in Express or Flask-Talisman.
+    metadata:
+      cwe: "CWE-1021: Improper Restriction of Rendered UI Layers"
+      owasp: "A05:2021 Security Misconfiguration"
+      owasp-api: "API8:2023 Security Misconfiguration"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $APP.$METHOD("/$ROUTE", $H)
+          - pattern: |
+              router.$METHOD("/$ROUTE", $H)
+      - pattern-not: |
+          $APP.$METHOD("/$ROUTE", helmet(), $H)
+      - pattern-not: |
+          $APP.$METHOD("/$ROUTE", $H)
+          ...
+          res.setHeader("Content-Security-Policy", ...)
+
+  - id: blog-xss-product-render
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      innerHTML with user-controlled data on blog (comments, posts).
+      Use textContent or DOMPurify. This is the most common XSS
+      vector for blogs.
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+      owasp: "A03:2021 Injection"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $EL.innerHTML = $REQ.body.comment
+          - pattern: |
+              $EL.innerHTML = $REQ.body.post
+          - pattern: |
+              <div dangerouslySetInnerHTML={{__html: $REQ.body.content}} />
+          - pattern: |
+              <span dangerouslySetInnerHTML={{__html: $REQ.body.title}} />
+
+  - id: blog-open-redirect
+    languages: [javascript, typescript, python]
+    severity: ERROR
+    message: >-
+      Open redirect vulnerability. User-controlled URL used in
+      res.redirect() allows phishing. Validate URL against an
+      allowlist of internal paths.
+    metadata:
+      cwe: "CWE-601: URL Redirection to Untrusted Site"
+      owasp: "A01:2021 Broken Access Control"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              res.redirect($REQ.query.next)
+          - pattern: |
+              res.redirect($REQ.query.url)
+          - pattern: |
+              res.redirect($REQ.body.redirect_to)
+          - pattern: |
+              return redirect($REQ.args.get("next"))
+
+  - id: blog-file-upload-no-validation
+    languages: [javascript, typescript, python]
+    severity: ERROR
+    message: >-
+      File upload without extension/MIME validation. Blog post
+      attachments (images, files) can be used to upload web shells.
+      Validate file extension AND MIME type. Reject .php, .jsp, .exe.
+    metadata:
+      cwe: "CWE-434: Unrestricted Upload of File with Dangerous Type"
+      owasp: "A04:2021 Insecure Design"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $REQ.files.image.mv($PATH)
+          - pattern: |
+              $REQ.files.attachment.save($PATH)
+      - pattern-not: |
+          if ($EXT in $ALLOWED): ...
+      - pattern-not: |
+          $EXT = path.extname($REQ.files.image.name)
+          if ($EXT in $ALLOWED): ...
+
+  - id: blog-markdown-xss
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Markdown rendering without sanitization. Use DOMPurify or marked
+      with sanitize:true. Blog comments often use markdown and
+      attackers can inject <script> via [link](javascript:...) or
+      <img onerror=...>.
+    metadata:
+      cwe: "CWE-79: Cross-site Scripting"
+      owasp: "A03:2021 Injection"
+    patterns:
+      - pattern-either:
+          - pattern: |
+              marked($REQ.body.content)
+          - pattern: |
+              marked.parse($REQ.body.comment)
+      - pattern-not: |
+          DOMPurify.sanitize(marked($REQ.body.content))
+      - pattern-not: |
+          marked($REQ.body.content, {sanitize: true})
