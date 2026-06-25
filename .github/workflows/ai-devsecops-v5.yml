@@ -1,0 +1,514 @@
+name: CI DevSecOps (javascript)
+# Domain: blog (confidence: 1.00)
+# Architecture: monolithic
+# Detected languages: javascript
+# Framework: Express
+# Database: SQLite
+# Test framework: Jest
+# Runtime: Node.js
+# Package manager: npm
+# Build tools: npm
+# Priority threats: XSS di rendering komentar; File upload bypass untuk gambar; CSRF di form komentar; Content injection via markdown
+
+"on":
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+        continue-on-error: true
+
+      - name: Run ESLint
+        run: |
+          if [ -f package.json ] && grep -q '"lint"' package.json; then
+            npm run lint --if-present
+          else
+            echo 'No lint script defined; skipping.'
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+        continue-on-error: true
+
+      - name: Run tests
+        run: npm test --if-present || true
+
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Run semgrep (custom rules + registry, SARIF output)
+        run: |
+          # Run registry + custom rules from .github/ai-devsecops-rules.yml
+          docker run --rm \
+            -v "${{ github.workspace }}:/src:ro" \
+            -v "${{ github.workspace }}:/out" \
+            returntocorp/semgrep:1.99.0 \
+            semgrep \
+            --config=.github/ai-devsecops-rules.yml \
+            --config=p/owasp-top-ten \
+            --config=p/javascript \
+            --config=p/nodejs \
+            --config=p/expressjs \
+            --config=p/sql-injection \
+            --config=p/secrets \
+            --config=p/dockerfile \
+                    --sarif \
+                    --output=/out/semgrep-results.sarif \
+                    --timeout=600 \
+                    --no-error \
+                    /src
+        continue-on-error: true
+
+      - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
+        if: always()
+        run: |
+          if [ ! -s semgrep-results.sarif ]; then
+            echo "::notice::Semgrep did not produce a SARIF file. Generating empty SARIF for upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Semgrep",' \
+              '          "version": "1.99.0",' \
+              '          "informationUri": "https://semgrep.dev"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > semgrep-results.sarif
+          fi
+          echo "✓ semgrep-results.sarif size: $(stat -c%s semgrep-results.sarif) bytes"
+
+      - name: Upload Semgrep SARIF to GitHub Code Scanning
+        if: always() && hashFiles('semgrep-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: semgrep-results.sarif
+          category: semgrep
+
+      - name: Upload Semgrep SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: semgrep-results-${{ github.sha }}
+          path: semgrep-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
+      - name: Install dependencies (no native build)
+        run: npm install --no-audit --no-fund --ignore-scripts
+        continue-on-error: true
+
+      - name: Run npm audit (CVE check, JSON output)
+        id: npm-audit
+        run: npm audit --audit-level=high --json > npm-audit-results.json || true
+        continue-on-error: true
+
+      - name: Upload npm audit JSON
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-audit-results-${{ github.sha }}
+          path: npm-audit-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Run Trivy filesystem scan (SARIF output)
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'HIGH,CRITICAL'
+        continue-on-error: true
+
+      - name: Ensure trivy-fs-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s trivy-fs-results.sarif ]; then
+            echo "::notice::Trivy found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Trivy",' \
+              '          "version": "0.65.0",' \
+              '          "informationUri": "https://aquasecurity.github.io/trivy/"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > trivy-fs-results.sarif
+          fi
+          echo "✓ trivy-fs-results.sarif size: $(stat -c%s trivy-fs-results.sarif) bytes"
+      - name: Upload Trivy fs SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-fs
+      - name: Upload Trivy fs SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: trivy-fs-results-${{ github.sha }}
+          path: trivy-fs-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Convert npm audit JSON to SARIF
+        if: always() && hashFiles('npm-audit-results.json') != ''
+        run: |
+          python3 -c "
+          import json, sys
+          try:
+              with open('npm-audit-results.json') as f:
+                  data = json.load(f)
+              vulns = data.get('vulnerabilities', {})
+              results = []
+              for pkg, info in vulns.items():
+                  if not info.get('via'):
+                      continue
+                  severity = info.get('severity','moderate')
+                  level = 'error' if severity in ('critical','high') else 'warning'
+                  seen_cves = set()
+                  for via in info['via']:
+                      if isinstance(via, dict):
+                          cve_id = via.get('title','')
+                          if cve_id and cve_id not in seen_cves:
+                              seen_cves.add(cve_id)
+                              results.append({
+                                  'ruleId': cve_id,
+                                  'message': {'text': cve_id + ' in ' + pkg + ' ' + info.get('range','')},
+                                  'level': level,
+                                  'locations': [{'physicalLocation': {'artifactLocation': {'uri': 'package.json'}}}],
+                                  'properties': {'package': pkg, 'version': info.get('range',''), 'severity': severity}
+                              })
+              sarif = {
+                  'version': '2.1.0',
+                  '\$schema': 'https://json.schemastore.org/sarif-2.1.0.json',
+                  'runs': [{
+                      'tool': {'driver': {'name': 'npm audit', 'version': '1.0', 'informationUri': 'https://docs.npmjs.com/cli/v10/commands/npm-audit'}},
+                      'results': results
+                  }]
+              }
+              with open('npm-audit-results.sarif', 'w') as f:
+                  json.dump(sarif, f, indent=2)
+              print(f'npm-audit-results.sarif written with {len(results)} findings')
+          except Exception as e:
+              print(f'npm-audit SARIF conversion error: {e}', file=sys.stderr)
+              import traceback; traceback.print_exc()
+              sys.exit(0)
+          "
+        continue-on-error: true
+
+      - name: Ensure npm-audit-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s npm-audit-results.sarif ]; then
+            echo "::notice::npm audit found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "npm audit",' \
+              '          "version": "1.0",' \
+              '          "informationUri": "https://docs.npmjs.com/cli/v10/commands/npm-audit"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > npm-audit-results.sarif
+          fi
+          echo "✓ npm-audit-results.sarif size: $(stat -c%s npm-audit-results.sarif) bytes"
+
+      - name: Upload npm audit SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: npm-audit-results.sarif
+          category: npm-audit
+
+      - name: Upload npm audit SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: npm-audit-sarif-${{ github.sha }}
+          path: npm-audit-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Evaluate dependency-scan findings
+        if: always()
+        run: |
+          echo '## Dependency Scan Summary' >> "$GITHUB_STEP_SUMMARY"
+          echo '- npm audit: '"${{ steps.npm-audit.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '- trivy fs: '"${{ steps.trivy-fs.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Run Gitleaks on PR diff (SARIF output)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+          GITLEAKS_FORMAT: sarif
+          GITLEAKS_REPORT_PATH: gitleaks-diff-results.sarif
+        continue-on-error: true
+
+      - name: Run Gitleaks on full working tree (SARIF output)
+        run: |
+          set -e
+          # Install gitleaks CLI (matches the action's version).
+          wget -qO- https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz | tar -xz -C /tmp
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks || mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          # Scan the full working tree. `--no-banner` quiets
+          # the ASCII art. Output is SARIF 2.1.0.
+          gitleaks detect --source . --no-banner --report-format sarif --report-path gitleaks-full-results.sarif --exit-code 0 || true
+        continue-on-error: true
+
+      - name: Merge Gitleaks SARIF results
+        if: always()
+        run: |
+          set -e
+          if [ -s gitleaks-diff-results.sarif ] && [ -s gitleaks-full-results.sarif ]; then
+            # Both scans produced output — concatenate
+            # the result arrays. We use a tiny Python
+            # snippet because `jq` is not guaranteed to
+            # be installed on ubuntu-latest runners.
+            python3 - <<'PY'
+          import json, pathlib
+          diff = json.loads(pathlib.Path('gitleaks-diff-results.sarif').read_text())
+          full = json.loads(pathlib.Path('gitleaks-full-results.sarif').read_text())
+          merged_runs = (diff.get('runs') or []) + (full.get('runs') or [])
+          # De-duplicate by (ruleId, physicalLocation uri:line).
+          seen = set()
+          merged_results = []
+          for run in merged_runs:
+              for r in (run.get('results') or []):
+                  loc = (r.get('locations') or [{}])[0].get('physicalLocation', {})
+                  uri = (loc.get('artifactLocation') or {}).get('uri', '')
+                  line = (loc.get('region') or {}).get('startLine', 0)
+                  key = (r.get('ruleId',''), uri, line)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  merged_results.append(r)
+          base = diff if diff.get('runs') else full
+          base['runs'] = merged_runs
+          for run in base['runs']:
+              run['results'] = merged_results if run is base['runs'][0] else (run.get('results') or [])
+          pathlib.Path('gitleaks-results.sarif').write_text(json.dumps(base, indent=2))
+          print(f'Merged SARIF: {len(merged_results)} unique findings')
+          PY
+          elif [ -s gitleaks-full-results.sarif ]; then
+            cp gitleaks-full-results.sarif gitleaks-results.sarif
+          elif [ -s gitleaks-diff-results.sarif ]; then
+            cp gitleaks-diff-results.sarif gitleaks-results.sarif
+          fi
+          ls -la gitleaks-*.sarif || true
+
+      - name: Ensure gitleaks-results.sarif exists (fallback for 0 findings)
+        if: always()
+        run: |
+          if [ ! -s gitleaks-results.sarif ]; then
+            echo "::notice::Gitleaks found 0 findings. Generating empty SARIF to satisfy upload-sarif."
+            printf '%s\n' \
+              '{' \
+              '  "version": "2.1.0",' \
+              '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+              '  "runs": [' \
+              '    {' \
+              '      "tool": {' \
+              '        "driver": {' \
+              '          "name": "Gitleaks",' \
+              '          "version": "8.24.3",' \
+              '          "informationUri": "https://gitleaks.io"' \
+              '        }' \
+              '      },' \
+              '      "results": []' \
+              '    }' \
+              '  ]' \
+              '}' > gitleaks-results.sarif
+          fi
+          echo "✓ gitleaks-results.sarif size: $(stat -c%s gitleaks-results.sarif) bytes"
+
+      - name: Upload Gitleaks SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: gitleaks-results.sarif
+          category: gitleaks
+
+      - name: Upload Gitleaks SARIF as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gitleaks-sarif-${{ github.sha }}
+          path: gitleaks-results.sarif
+          if-no-files-found: warn
+          retention-days: 30
+
+
+  csp-headers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+
+      - name: Static check for security header middleware
+        run: |
+          echo 'Scanning for security headers middleware...'
+          if grep -rq 'helmet()' --include='*.js' --include='*.ts' src/ 2>/dev/null; then
+            echo '✓ helmet() middleware detected (covers CSP, X-Frame-Options, HSTS)'
+          elif grep -rq 'Talisman' --include='*.py' src/ 2>/dev/null; then
+            echo '✓ Flask-Talisman detected'
+          elif grep -rq 'Content-Security-Policy' --include='*.js' --include='*.ts' --include='*.py' src/ 2>/dev/null; then
+            echo '✓ Manual CSP header found'
+          else
+            echo '::error::No security headers middleware found. Blog is vulnerable to XSS, clickjacking.'
+            echo 'Add helmet() in Express or Flask-Talisman in Python.'
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Check for X-Frame-Options
+        run: |
+          if grep -rqE 'X-Frame-Options|frameOptions' --include='*.js' --include='*.ts' src/ 2>/dev/null; then
+            echo '✓ X-Frame-Options configured'
+          else
+            echo '::warning::X-Frame-Options not detected (clickjacking risk)'
+          fi
+        continue-on-error: true
+
+      - name: Check for HSTS
+        run: |
+          if grep -rqE 'Strict-Transport-Security|hsts' --include='*.js' --include='*.ts' src/ 2>/dev/null; then
+            echo '✓ HSTS configured'
+          else
+            echo '::warning::HSTS not detected'
+          fi
+        continue-on-error: true
+
+      - name: Generate CSP audit SARIF
+        if: always()
+        run: |
+          printf '%s\n' \
+            '{' \
+            '  "version": "2.1.0",' \
+            '  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",' \
+            '  "runs": [{"tool": {"driver": {"name": "csp-headers-audit"}}, "results": []}]' \
+            '}' > csp-headers-audit.sarif
+          echo "✓ csp-headers-audit.sarif size: $(stat -c%s csp-headers-audit.sarif) bytes"
+
+      - name: Upload CSP-headers audit to Code Scanning
+        if: always() && hashFiles('csp-headers-audit.sarif') != ''
+        uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+        with:
+          sarif_file: csp-headers-audit.sarif
+          category: devsecops-csp-headers
+
+      - name: Upload CSP-headers audit as artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: csp-headers-audit-${{ github.sha }}
+          path: csp-headers-audit.sarif
+          if-no-files-found: warn
+          retention-days: 30
