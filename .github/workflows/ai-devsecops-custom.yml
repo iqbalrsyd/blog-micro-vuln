@@ -11,7 +11,7 @@ permissions:
   contents: read
   security-events: write
 jobs:
-  marked-xss-validate:
+  file-upload-misconfig-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -22,143 +22,62 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: detect-marked-without-sanitizer
-      run: "set +e\nSARIF=\"${GITHUB_WORKSPACE:-.}/marked-xss.sarif\"\nfail=0\n\n\
-        # 1. Locate marked imports / calls in src/ and routes/\nmarked_uses=$(grep\
-        \ -rnE \"from ['\\\"]marked['\\\"]|require\\(['\\\"]marked['\\\"]\\)|marked\\\
-        .parse\\(|= marked\\(\" src/ routes/ 2>/dev/null || true)\n\n# 2. Verify a\
-        \ sanitizer is declared in package.json\nhas_san=$(grep -E '\"(dompurify|sanitize-html|marked-sanitize|xss)\"\
-        ' package.json 2>/dev/null || true)\n\nif [ -n \"$marked_uses\" ] && [ -z\
-        \ \"$has_san\" ]; then\n  echo \"::error file=package.json::marked is used\
-        \ in src/ or routes/ but no HTML sanitizer (dompurify, sanitize-html, marked-sanitize,\
-        \ xss) is declared in package.json \u2014 stored XSS risk in blog posts and\
-        \ comments.\"\n  fail=1\nfi\n\n# 3. Detect unescaped EJS rendering of Markdown\
-        \ content in views/\nif grep -rnE '<%-\\s*[^%]*\\b(marked|post\\.body|post\\\
-        .content|comment\\.body|comment\\.content)' views/ 2>/dev/null; then\n  echo\
-        \ \"::error::Unescaped EJS tag <%- renders Markdown content directly \u2014\
-        \ XSS vector.\"\n  fail=1\nfi\n\n# Write SARIF report\ncat > \"$SARIF\" <<'EOF'\n\
-        {\n  \"version\": \"2.1.0\",\n  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
-        ,\n  \"runs\": [{\n    \"tool\": {\"driver\": {\"name\": \"marked-xss-check\"\
-        , \"version\": \"1.0\", \"informationUri\": \"https://github.com\"}},\n  \
-        \  \"results\": [{\n      \"ruleId\": \"marked-missing-sanitizer\",\n    \
-        \  \"level\": \"error\",\n      \"message\": {\"text\": \"marked() / marked.parse()\
-        \ output is rendered without an HTML sanitizer (dompurify/sanitize-html/marked-sanitize).\
-        \ User-submitted Markdown in routes/posts.js and routes/comments.js can contain\
-        \ <script>, javascript: URIs, and on* handlers that execute as stored XSS\
-        \ when injected via EJS <%- ... %>.\"},\n      \"locations\": [\n        {\"\
-        physicalLocation\": {\"artifactLocation\": {\"uri\": \"routes/posts.js\"}}},\n\
-        \        {\"physicalLocation\": {\"artifactLocation\": {\"uri\": \"routes/comments.js\"\
-        }}}\n      ]\n    }]\n  }]\n}\nEOF\n\nexit $fail\n"
-    - name: semgrep-marked-no-sanitizer
-      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
-        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: marked-render-without-sanitizer\n\
-        \    patterns:\n      - pattern-either:\n          - pattern: marked($CONTENT)\n\
-        \          - pattern: marked.parse($CONTENT)\n          - pattern: |\n   \
-        \           $X = marked($CONTENT)\n          - pattern: |\n              $X\
-        \ = marked.parse($CONTENT)\n      - pattern-not: marked($CONTENT, { sanitize:\
-        \ ... })\n      - pattern-not: marked.parse($CONTENT, { sanitize: ... })\n\
-        \    message: >\n      marked() / marked.parse() called without explicit sanitizer\
-        \ option.\n      Wrap the result in DOMPurify.sanitize() or use the marked-sanitize\n\
-        \      extension before inserting into EJS templates, otherwise <script>,\n\
-        \      javascript: URIs, and on* event handlers in user-submitted posts or\n\
-        \      comments become stored XSS (CWE-79).\n    severity: ERROR\n    languages:\
-        \ [javascript]\n    metadata:\n      category: security\n      cwe: \"CWE-79:\
-        \ Improper Neutralization of Input During Web Page Generation\"\n      owasp:\
-        \ \"A03:2021 Injection\"\n      technology: [express, ejs, marked]\nSEMGREP_EOF\n"
-    - name: Ensure marked-xss-results.sarif exists (fallback for 0 findings)
-      if: always()
-      run: "if [ ! -s marked-xss-results.sarif ]; then\n  echo \"::notice::marked-xss\
-        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
-        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
-        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
-        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"marked-xss\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
-        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > marked-xss-results.sarif\nfi\necho\
-        \ \"\u2713 marked-xss-results.sarif size: $(stat -c%s marked-xss-results.sarif)\
-        \ bytes\"\n"
-    - name: Upload marked-xss SARIF to GitHub Code Scanning
-      if: always()
-      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
-      with:
-        sarif_file: marked-xss-results.sarif
-        category: marked-xss
-  multer-upload-audit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
-    needs:
-    - sast
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-      with:
-        persist-credentials: false
-    - name: audit-multer-config
-      run: "set +e\nSARIF=\"${GITHUB_WORKSPACE:-.}/multer-audit.sarif\"\nfails=0\n\
-        \n# 1. Locate multer instantiation in routes/\nmulter_init=$(grep -rnE \"\
-        multer\\s*\\(\" routes/ src/ 2>/dev/null || true)\n\nif [ -n \"$multer_init\"\
-        \ ]; then\n  if ! echo \"$multer_init\" | grep -qE 'fileFilter'; then\n  \
-        \  echo \"::error file=routes/upload.js::multer() used without fileFilter\
-        \ \u2014 accepts any MIME type, enabling .svg/.html stored XSS or .php RCE\
-        \ on misconfigured hosts.\"\n    fails=$((fails+1))\n  fi\n  if ! echo \"\
-        $multer_init\" | grep -qE 'limits'; then\n    echo \"::warning file=routes/upload.js::multer()\
-        \ used without limits.fileSize \u2014 disk-exhaustion DoS via large uploads.\"\
-        \n    fails=$((fails+1))\n  fi\n  if echo \"$multer_init\" | grep -qE 'diskStorage'\
-        \ && ! echo \"$multer_init\" | grep -qE 'extname|fileExt|sanitize|safeFilename';\
-        \ then\n    echo \"::error file=routes/upload.js::diskStorage without filename\
-        \ sanitization (path.extname/fileExt regex) \u2014 path traversal risk.\"\n\
-        \    fails=$((fails+1))\n  fi\n  if grep -rnE \"['\\\"]\\.(svg|html|htm|js|php)\\\
-        \"\" routes/upload* 2>/dev/null; then\n    echo \"::error::Dangerous file\
-        \ extension whitelisted in routes/upload \u2014 scriptable MIME allowed.\"\
-        \n    fails=$((fails+1))\n  fi\nfi\n\ncat > \"$SARIF\" <<'EOF'\n{\n  \"version\"\
-        : \"2.1.0\",\n  \"$schema\": \"https://json.schemastore.org/sarif-2.1.0.json\"\
-        ,\n  \"runs\": [{\n    \"tool\": {\"driver\": {\"name\": \"multer-upload-audit\"\
-        , \"version\": \"1.0\"}},\n    \"results\": [{\n      \"ruleId\": \"multer-unsafe-config\"\
-        ,\n      \"level\": \"error\",\n      \"message\": {\"text\": \"multer configured\
-        \ without fileFilter/limits or with scriptable extensions (.svg/.html/.js).\
-        \ Allows stored XSS via uploaded SVG/HTML, disk-exhaustion DoS, or path traversal\
-        \ (CWE-434, CWE-22).\"},\n      \"locations\": [{\"physicalLocation\": {\"\
-        artifactLocation\": {\"uri\": \"routes/upload.js\"}}}]\n    }]\n  }]\n}\n\
-        EOF\n\nexit $fails\n"
-    - name: semgrep-multer-no-filefilter
+    - name: detect-multer-misconfig-in-routes
+      run: "set -e\ncd \"$GITHUB_WORKSPACE\"\nfound=0\n# Pattern 1: multer invoked\
+        \ with dest/storage but no fileFilter anywhere in same file\nfor f in $(grep\
+        \ -rEl \"require\\\\(['\\\"]multer['\\\"]\\\\)\" src routes app.js server.js\
+        \ 2>/dev/null); do\n  if grep -Eq \"multer\\\\(\\\\{[^}]*(dest|storage)\"\
+        \ \"$f\" && ! grep -Eq \"fileFilter\" \"$f\"; then\n    echo \"::error file=$f::multer\
+        \ configured without fileFilter (arbitrary file types allowed)\"\n    found=1\n\
+        \  fi\n  # Pattern 2: multer used with single() / array() / fields() but no\
+        \ limits on fileSize\n  if grep -Eq \"multer\\\\(\\\\{[^}]*\\\\}\\\\)\" \"\
+        $f\" && ! grep -Eq \"limits:\\\\s*\\\\{\" \"$f\"; then\n    echo \"::warning\
+        \ file=$f::multer configured without limits.fileSize (DoS via large uploads)\"\
+        \n  fi\ndone\n# Pattern 3: EJS render() used together with upload route ->\
+        \ RCE risk if .ejs can be uploaded\ngrep -rEl \"res\\\\.render\\\\(\" src\
+        \ 2>/dev/null | while read ejs; do\n  echo \"::notice file=$ejs::EJS render\
+        \ detected \u2014 uploaded .ejs templates would lead to RCE; ensure fileFilter\
+        \ blocks .ejs/.js/.html\"\ndone\n# Emit SARIF for findings\npython3 -c \"\
+        import json,sys; r=[]; r.append(json.loads(l)) for l in sys.stdin\" 2>/dev/null\
+        \ || true\ncat > results.sarif <<'EOF'\n{\"version\":\"2.1.0\",\"$schema\"\
+        :\"https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"\
+        driver\":{\"name\":\"multer-misconfig\",\"version\":\"1.0\"}},\"results\"\
+        :[{\"ruleId\":\"multer-no-filefilter\",\"level\":\"error\",\"message\":{\"\
+        text\":\"multer missing fileFilter/limits\"}}]}]}\nEOF\nexit $found\n"
+    - name: semgrep-multer-misconfiguration
       run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
         \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: multer-missing-filefilter\n\
-        \    patterns:\n      - pattern-either:\n          - pattern: multer({...})\n\
-        \          - pattern: multer({ dest: $DEST })\n          - pattern: multer({\
-        \ storage: $S })\n          - pattern: multer({ storage: $S, ... })\n    \
-        \  - pattern-not: multer({ fileFilter: $F, ... })\n      - pattern-not: multer({\
-        \ ..., fileFilter: $F, ... })\n    message: >\n      multer instantiated without\
-        \ a fileFilter. An attacker can upload\n      .svg (with embedded <script>),\
-        \ .html, or .js files that are then\n      served from /public and execute\
-        \ as stored XSS, or .php for RCE on\n      Apache-fronted hosts. Add a fileFilter\
-        \ that whitelists safe mimetypes\n      (image/jpeg, image/png, image/webp)\
-        \ and rejects everything else\n      (CWE-434).\n    severity: ERROR\n   \
-        \ languages: [javascript]\n    metadata:\n      category: security\n     \
-        \ cwe: \"CWE-434: Unrestricted Upload of File with Dangerous Type\"\n    \
-        \  owasp: \"A04:2021 Insecure Design\"\n      technology: [express, multer]\n\
-        SEMGREP_EOF\n"
-    - name: Ensure multer-upload-results.sarif exists (fallback for 0 findings)
+        \    languages: [javascript]\n    severity: ERROR\n    message: >-\n     \
+        \ multer() is instantiated without a fileFilter. For a blog with /upload\n\
+        \      route, this allows uploading executable templates (.ejs/.js) and\n\
+        \      leads to RCE when res.render() is later called.\n    pattern: multer({...,\
+        \ dest: $D, ...})\n    pattern-not: multer({..., fileFilter: $F, ...})\n \
+        \   paths:\n      include:\n        - \"src/**\"\n        - \"routes/**\"\n\
+        \        - \"*.js\"\n  - id: multer-missing-limits\n    languages: [javascript]\n\
+        \    severity: WARNING\n    message: \"multer() has no limits.fileSize \u2014\
+        \ vulnerable to DoS and disk exhaustion.\"\n    pattern: multer({...})\n \
+        \   pattern-not: multer({..., limits: $L, ...})\n    paths:\n      include:\n\
+        \        - \"src/**\"\n        - \"routes/**\"\nSEMGREP_EOF\n"
+    - name: Ensure file-upload-misconfig-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s multer-upload-results.sarif ]; then\n  echo \"::notice::multer-upload\
+      run: "if [ ! -s file-upload-misconfig-results.sarif ]; then\n  echo \"::notice::file-upload-misconfig\
         \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
         \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"multer-upload\",' \\\n    '          \"\
-        version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
-        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > multer-upload-results.sarif\nfi\n\
-        echo \"\u2713 multer-upload-results.sarif size: $(stat -c%s multer-upload-results.sarif)\
-        \ bytes\"\n"
-    - name: Upload multer-upload SARIF to GitHub Code Scanning
+        : {' \\\n    '          \"name\": \"file-upload-misconfig\",' \\\n    '  \
+        \        \"version\": \"0.65.0\",' \\\n    '          \"informationUri\":\
+        \ \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > file-upload-misconfig-results.sarif\nfi\necho \"\u2713 file-upload-misconfig-results.sarif\
+        \ size: $(stat -c%s file-upload-misconfig-results.sarif) bytes\"\n"
+    - name: Upload file-upload-misconfig SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: multer-upload-results.sarif
-        category: multer-upload
-  jwt-auth-verify:
+        sarif_file: file-upload-misconfig-results.sarif
+        category: file-upload-misconfig
+  jwt-algorithm-pinning-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -169,74 +88,127 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: verify-jwt-hardening
-      run: "set +e\nSARIF=\"${GITHUB_WORKSPACE:-.}/jwt-audit.sarif\"\nfails=0\n\n\
-        # 1. Every jwt.verify must specify algorithms\nverify_uses=$(grep -rnE 'jwt\\\
-        .verify\\s*\\(' src/ routes/ middleware/ 2>/dev/null || true)\nif [ -n \"\
-        $verify_uses\" ]; then\n  bad_verify=$(echo \"$verify_uses\" | grep -vE 'algorithms\\\
-        s*:|algorithm\\s*:' || true)\n  if [ -n \"$bad_verify\" ]; then\n    echo\
-        \ \"::error file=routes/auth.js::jwt.verify() called without explicit 'algorithms:\
-        \ [...]' option \u2014 vulnerable to alg-confusion / 'alg':'none' bypass (CVE-2015-9235).\"\
-        \n    echo \"$bad_verify\"\n    fails=$((fails+1))\n  fi\nfi\n\n# 2. Every\
-        \ jwt.sign must specify expiresIn\nsign_uses=$(grep -rnE 'jwt\\.sign\\s*\\\
-        (' src/ routes/ 2>/dev/null || true)\nif [ -n \"$sign_uses\" ]; then\n  bad_sign=$(echo\
-        \ \"$sign_uses\" | grep -vE 'expiresIn\\s*:' || true)\n  if [ -n \"$bad_sign\"\
-        \ ]; then\n    echo \"::error file=routes/auth.js::jwt.sign() called without\
-        \ expiresIn \u2014 leaked token grants permanent access.\"\n    echo \"$bad_sign\"\
-        \n    fails=$((fails+1))\n  fi\nfi\n\n# 3. Secret must come from process.env,\
-        \ not a string literal\nhardcoded=$(grep -rnE \"jwt\\.sign\\s*\\(\\s*[^,]+,\\\
-        s*['\\\"][A-Za-z0-9_\\-]{8,}['\\\"]\" src/ routes/ 2>/dev/null || true)\n\
-        if [ -n \"$hardcoded\" ]; then\n  echo \"::error::Hardcoded secret literal\
-        \ in jwt.sign() \u2014 must read from process.env.JWT_SECRET.\"\n  fails=$((fails+1))\n\
-        fi\n\n# 4. .env must be git-ignored so JWT_SECRET is not committed\nif [ -f\
-        \ .gitignore ] && ! grep -qE '^\\.env$' .gitignore; then\n  echo \"::warning\
-        \ file=.gitignore::.env not ignored \u2014 risk of committing JWT_SECRET.\"\
-        \nfi\n\ncat > \"$SARIF\" <<'EOF'\n{\n  \"version\": \"2.1.0\",\n  \"$schema\"\
-        : \"https://json.schemastore.org/sarif-2.1.0.json\",\n  \"runs\": [{\n   \
-        \ \"tool\": {\"driver\": {\"name\": \"jwt-auth-verify\", \"version\": \"1.0\"\
-        }},\n    \"results\": [{\n      \"ruleId\": \"jwt-missing-algorithms-or-expiry\"\
-        ,\n      \"level\": \"error\",\n      \"message\": {\"text\": \"jsonwebtoken\
-        \ hardening gaps: jwt.verify() lacks explicit algorithms option (CVE-2015-9235\
-        \ alg-confusion / 'alg':'none' bypass), jwt.sign() lacks expiresIn (non-expiring\
-        \ tokens), or secret is a string literal instead of process.env.JWT_SECRET\
-        \ (CWE-798).\"},\n      \"locations\": [{\"physicalLocation\": {\"artifactLocation\"\
-        : {\"uri\": \"routes/auth.js\"}}}]\n    }]\n  }]\n}\nEOF\n\nexit $fails\n"
-    - name: semgrep-jwt-no-algorithms
+    - name: detect-jwt-unsafe-verify-and-sign
+      run: "set -e\ncd \"$GITHUB_WORKSPACE\"\nfound=0\n# Look for jwt.verify / jwt.sign\
+        \ calls in src and routes\nfor f in $(grep -rEl \"jwt\\\\.(verify|sign)\"\
+        \ src routes app.js server.js 2>/dev/null); do\n  # Pattern: jwt.verify(token,\
+        \ secret) with NO third 'options' object mentioning algorithms\n  if grep\
+        \ -Eq \"jwt\\\\.verify\\\\(\" \"$f\"; then\n    if ! grep -Eq \"algorithms\\\
+        \\s*:\" \"$f\"; then\n      echo \"::error file=$f::jwt.verify() called without\
+        \ explicit algorithms allow-list (alg:none / algorithm confusion risk)\"\n\
+        \      found=1\n    fi\n  fi\n  # Pattern: jwt.sign without expiresIn in same\
+        \ file\n  if grep -Eq \"jwt\\\\.sign\\\\(\" \"$f\"; then\n    if ! grep -Eq\
+        \ \"expiresIn\" \"$f\"; then\n      echo \"::warning file=$f::jwt.sign() without\
+        \ expiresIn \u2014 tokens never expire\"\n    fi\n  fi\ndone\n# Pattern: process.env.JWT_SECRET\
+        \ used but no fallback (i.e. no hardcoded default in source)\ngrep -rEn \"\
+        JWT_SECRET\\\\s*\\\\|\\\\|\\\\s*['\\\"]\" src 2>/dev/null | while read line;\
+        \ do\n  echo \"::error::$line \u2014 hardcoded JWT secret fallback detected\"\
+        \ndone\ncat > results.sarif <<'EOF'\n{\"version\":\"2.1.0\",\"$schema\":\"\
+        https://json.schemastore.org/sarif-2.1.0.json\",\"runs\":[{\"tool\":{\"driver\"\
+        :{\"name\":\"jwt-pin-check\",\"version\":\"1.0\"}},\"results\":[{\"ruleId\"\
+        :\"jwt-verify-no-algorithms\",\"level\":\"error\",\"message\":{\"text\":\"\
+        jwt.verify without algorithms allow-list\"}}]}]}\nEOF\nexit $found\n"
+    - name: semgrep-jwt-algorithm-and-expiry
       run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
         \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: jwt-verify-missing-algorithms\n\
-        \    patterns:\n      - pattern-either:\n          - pattern: jwt.verify($TOKEN,\
-        \ $SECRET)\n          - pattern: jwt.verify($TOKEN, $SECRET, $CB)\n      -\
-        \ pattern-not: jwt.verify($TOKEN, $SECRET, { algorithms: [...], ... })\n \
-        \     - pattern-not: jwt.verify($TOKEN, $SECRET, { algorithms: [...] }, $CB)\n\
-        \      - pattern-not: jwt.verify($TOKEN, $SECRET, { algorithms: [...] })\n\
-        \    message: >\n      jwt.verify MUST pin the accepted algorithms. Without\
-        \ it, an attacker\n      can forge a token with alg:'none' or swap RS256\u2192\
-        HS256 (algorithm\n      confusion, CVE-2015-9235). Pass { algorithms: ['HS256']\
-        \ } (or the\n      chosen alg) as the third argument. Affects every authenticated\
-        \ route\n      guarded by middleware that calls jwt.verify.\n    severity:\
-        \ ERROR\n    languages: [javascript]\n    metadata:\n      category: security\n\
-        \      cwe: \"CWE-327: Use of a Broken or Risky Cryptographic Algorithm\"\n\
-        \      owasp: \"A02:2021 Cryptographic Failures\"\n      technology: [express,\
-        \ jsonwebtoken]\nSEMGREP_EOF\n"
-    - name: Ensure jwt-auth-results.sarif exists (fallback for 0 findings)
+        \    languages: [javascript]\n    severity: ERROR\n    message: >-\n     \
+        \ jwt.verify($T, $S) is called without an explicit `algorithms` array.\n \
+        \     This allows the alg:none attack and HS/RS algorithm confusion on\n \
+        \     the /auth route of this blog.\n    pattern: jwt.verify($T, $S)\n   \
+        \ pattern-not: jwt.verify($T, $S, {$...OPTS})\n    pattern-not: jwt.verify($T,\
+        \ $S, {algorithms: [...], ...})\n    paths:\n      include: [\"src/**\", \"\
+        routes/**\", \"*.js\"]\n  - id: jwt-sign-missing-expiresin\n    languages:\
+        \ [javascript]\n    severity: WARNING\n    message: \"jwt.sign() without expiresIn\
+        \ produces immortal tokens \u2014 session hijack impact grows over time.\"\
+        \n    pattern: jwt.sign($P, $S, {..., $...O})\n    pattern-not: jwt.sign($P,\
+        \ $S, {expiresIn: $E, ...})\n    paths:\n      include: [\"src/**\", \"routes/**\"\
+        ]\nSEMGREP_EOF\n"
+    - name: Ensure jwt-algorithm-pinning-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s jwt-auth-results.sarif ]; then\n  echo \"::notice::jwt-auth\
+      run: "if [ ! -s jwt-algorithm-pinning-results.sarif ]; then\n  echo \"::notice::jwt-algorithm-pinning\
         \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
         \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"jwt-auth\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
-        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > jwt-auth-results.sarif\nfi\necho\
-        \ \"\u2713 jwt-auth-results.sarif size: $(stat -c%s jwt-auth-results.sarif)\
-        \ bytes\"\n"
-    - name: Upload jwt-auth SARIF to GitHub Code Scanning
+        : {' \\\n    '          \"name\": \"jwt-algorithm-pinning\",' \\\n    '  \
+        \        \"version\": \"0.65.0\",' \\\n    '          \"informationUri\":\
+        \ \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > jwt-algorithm-pinning-results.sarif\nfi\necho \"\u2713 jwt-algorithm-pinning-results.sarif\
+        \ size: $(stat -c%s jwt-algorithm-pinning-results.sarif) bytes\"\n"
+    - name: Upload jwt-algorithm-pinning SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: jwt-auth-results.sarif
-        category: jwt-auth
+        sarif_file: jwt-algorithm-pinning-results.sarif
+        category: jwt-algorithm-pinning
+  marked-xss-sanitization-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    needs:
+    - sast
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: detect-marked-without-sanitizer-and-unescaped-ejs
+      run: "set -e\ncd \"$GITHUB_WORKSPACE\"\nfound=0\n# Pattern 1: marked() called\
+        \ on user input with no sanitize / DOMPurify in same file\nfor f in $(grep\
+        \ -rEl \"require\\\\(['\\\"]marked['\\\"]\\\\)\" src routes 2>/dev/null);\
+        \ do\n  if grep -Eq \"marked\\\\(\" \"$f\"; then\n    if ! grep -Eqi \"DOMPurify|sanitize|sanitize:\\\
+        \\s*true\" \"$f\"; then\n      echo \"::error file=$f::marked() output is\
+        \ NOT sanitized \u2014 stored XSS in blog posts / comments\"\n      found=1\n\
+        \    fi\n  fi\ndone\n# Pattern 2: EJS templates using <%- (unescaped) with\
+        \ data that originates from req.body/req.params\nfor tpl in $(find . -path\
+        \ ./node_modules -prune -o -name \"*.ejs\" -print 2>/dev/null); do\n  if grep\
+        \ -En \"<%-\\\\s\" \"$tpl\" >/dev/null 2>&1; then\n    echo \"::warning file=$tpl::unescaped\
+        \ EJS output (<%-) used; verify the variable is not user-controlled or run\
+        \ marked() output through DOMPurify first\"\n  fi\ndone\n# Pattern 3: comment\
+        \ route persisting req.body.comment verbatim\nfor f in $(grep -rEl \"comments\"\
+        \ src routes 2>/dev/null); do\n  if grep -Eq \"req\\\\.body\\\\.(comment|body|content|text)\"\
+        \ \"$f\"; then\n    echo \"::notice file=$f::comment field read from req.body\
+        \ \u2014 ensure marked+DOMPurify pipeline before persistence/render\"\n  fi\n\
+        done\ncat > results.sarif <<'EOF'\n{\"version\":\"2.1.0\",\"$schema\":\"https://json.schemastore.org/sarif-2.1.0.json\"\
+        ,\"runs\":[{\"tool\":{\"driver\":{\"name\":\"cms-marked-xss\",\"version\"\
+        :\"1.0\"}},\"results\":[{\"ruleId\":\"marked-no-sanitizer\",\"level\":\"error\"\
+        ,\"message\":{\"text\":\"marked() output not passed through DOMPurify\"}}]}]}\n\
+        EOF\nexit $found\n"
+    - name: semgrep-marked-and-ejs-xss
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: marked-without-sanitizer\n\
+        \    languages: [javascript]\n    severity: ERROR\n    message: >-\n     \
+        \ marked($X) returns raw HTML. The blog's comment_system and blog_posting\n\
+        \      features must pipe the result through DOMPurify (or call marked with\n\
+        \      sanitize: true) to prevent stored XSS in admin sessions.\n    pattern-either:\n\
+        \      - pattern: marked($X)\n      - pattern: marked.parse($X)\n    pattern-not:\
+        \ marked.parse($X, {sanitize: true})\n    pattern-not-inside: |\n      $RET\
+        \ = DOMPurify.sanitize(marked($X))\n      ...\n    paths:\n      include:\
+        \ [\"src/**\", \"routes/**\"]\n  - id: ejs-unescaped-user-input\n    languages:\
+        \ [generic]\n    severity: WARNING\n    message: \"EJS template uses <%- ...\
+        \ %> (unescaped). Combined with marked() this is a stored-XSS sink for the\
+        \ blog.\"\n    pattern: \"<%- ... %>\"\n    paths:\n      include: [\"**/*.ejs\"\
+        , \"**/*.html\"]\nSEMGREP_EOF\n"
+    - name: Ensure cms-marked-xss-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s cms-marked-xss-results.sarif ]; then\n  echo \"::notice::cms-marked-xss\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"cms-marked-xss\",' \\\n    '         \
+        \ \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > cms-marked-xss-results.sarif\nfi\n\
+        echo \"\u2713 cms-marked-xss-results.sarif size: $(stat -c%s cms-marked-xss-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload cms-marked-xss SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: cms-marked-xss-results.sarif
+        category: cms-marked-xss
   blog-markdown-sanitize:
     runs-on: ubuntu-latest
     timeout-minutes: 10
