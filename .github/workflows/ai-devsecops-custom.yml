@@ -11,7 +11,7 @@ permissions:
   contents: read
   security-events: write
 jobs:
-  blog-markdown-xss-scan:
+  cms-marked-xss-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -20,117 +20,92 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: detect-marked-without-sanitizer
-      run: "set -e\nmkdir -p sarif-output\n# 1. Find all call sites of marked() in\
-        \ application code (exclude node_modules and views/templates)\nif grep -rEn\
-        \ \"\\bmarked\\s*\\(\" --include=\"*.js\" --include=\"*.ejs\" --exclude-dir=node_modules\
-        \ --exclude-dir=views . ; then\n  MARKED_FOUND=1\nelse\n  MARKED_FOUND=0\n\
-        fi\n# 2. Look for any HTML/Markdown sanitizer library (DOMPurify, sanitize-html,\
-        \ xss)\nif grep -rEn \"require\\(['\\\"]dompurify['\\\"]\\)|require\\(['\\\
-        \"]sanitize-html['\\\"]\\)|require\\(['\\\"]xss['\\\"]\\)|DOMPurify\\.sanitize|sanitizeHtml\\\
-        (\" --include=\"*.js\" --exclude-dir=node_modules . ; then\n  SANITIZER_FOUND=1\n\
-        else\n  SANITIZER_FOUND=0\nfi\n# 3. Look for EJS unescaped output blocks adjacent\
-        \ to content variables (heuristic)\nif grep -rEn \"<%-\\s*.*(content|body|markdown|post|comment)\"\
-        \ --include=\"*.ejs\" --exclude-dir=node_modules views/ 2>/dev/null ; then\n\
-        \  EJS_UNESCAPED=1\nelse\n  EJS_UNESCAPED=0\nfi\n# Fail if marked is used\
-        \ without a sanitizer\nif [ \"$MARKED_FOUND\" = \"1\" ] && [ \"$SANITIZER_FOUND\"\
-        \ = \"0\" ]; then\n  echo \"::error title=Unsafe Markdown rendering::marked()\
-        \ detected without DOMPurify/sanitize-html/xss - stored XSS in blog posts\
-        \ and comments\"\n  exit 1\nfi\nif [ \"$EJS_UNESCAPED\" = \"1\" ] && [ \"\
-        $SANITIZER_FOUND\" = \"0\" ]; then\n  echo \"::error title=Unescaped EJS output::EJS\
-        \ <%- %> output of user content without sanitizer detected\"\n  exit 1\nfi\n\
-        echo \"OK: Markdown rendering is sanitized or no marked() usage found.\"\n"
+    - name: detect-unsafe-marked-call-and-missing-sanitizer
+      run: "set -o pipefail\n{\nset -e\necho \"::group::Scanning for marked() without\
+        \ sanitize option\"\n# Find every call site of marked/marked.parse in the\
+        \ blog code\nUNSAFE=$(grep -rEn 'marked\\s*\\(|marked\\.parse\\s*\\(' src/\
+        \ views/ --include='*.js' --include='*.ejs' 2>/dev/null | grep -viE 'sanitize\\\
+        s*:\\s*true' || true)\nif [ -n \"$UNSAFE\" ]; then\n  echo \"::error file=src/routes/posts.js::marked()\
+        \ invoked without sanitize:true - stored XSS in blog posts/comments\"\n  echo\
+        \ \"$UNSAFE\" | while IFS= read -r line; do echo \"::error::$line\"; done\n\
+        \  FOUND=1\nfi\n# Verify a sanitizer is actually present downstream (DOMPurify\
+        \ or sanitize-html)\nif ! grep -qE '\"(dompurify|sanitize-html)\"' package.json;\
+        \ then\n  echo \"::error file=package.json::No HTML sanitizer (dompurify/sanitize-html)\
+        \ declared - rendered Markdown stays raw\"\n  FOUND=1\nfi\n# Ensure EJS does\
+        \ not disable auto-escaping via <%- %> around marked output\nif grep -rEn\
+        \ '<%-.*(marked|post|comment|content).*%>' views/ 2>/dev/null; then\n  echo\
+        \ \"::error file=views/*.ejs::Raw <%- %> used on markdown-derived content\
+        \ - bypasses EJS escaping\"\n  FOUND=1\nfi\n[ -z \"$FOUND\" ] && echo \"OK:\
+        \ marked calls appear sanitized\"\n} 2>&1 | tee -a cms-marked-xss.shell_log\n"
     - name: marked-no-sanitize-inline-rule
-      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
-
-        echo ''Rule body:''
-
-        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
-
-
-        SEMGREP_EOF
-
-        '
-    - name: Convert sast annotations to SARIF
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: blog-marked-missing-sanitize\n\
+        \    languages: [javascript, typescript]\n    severity: ERROR\n    message:\
+        \ |\n      marked()/marked.parse() called without {sanitize:true} in this\
+        \ blog codebase\n      (routes/posts.js, routes/comments.js). User-supplied\
+        \ Markdown in posts and\n      comments is rendered into EJS views, enabling\
+        \ stored XSS (CWE-79).\n    metadata:\n      category: security\n      cwe:\
+        \ \"CWE-79: Improper Neutralization of Input During Web Page Generation\"\n\
+        \      technology: [express, ejs, marked]\n      confidence: HIGH\n    patterns:\n\
+        \      - pattern-either:\n          - pattern: marked($INPUT, $OPTS)\n   \
+        \       - pattern: marked.parse($INPUT, $OPTS)\n          - pattern: marked($INPUT)\n\
+        \          - pattern: marked.parse($INPUT)\n      - pattern-not: marked($INPUT,\
+        \ {sanitize: true, ...})\n      - pattern-not: marked.parse($INPUT, {sanitize:\
+        \ true, ...})\nSEMGREP_EOF\n"
+    - name: Convert cms-marked-xss shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: sast-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'sast';\nconst\
-          \ toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-sast';\n\n// Fetch all annotations for\
-          \ this run (max 100; for bigger\n// runs, paginate via per_page=100 + page=N).\n\
-          let annotations = [];\nlet page = 1;\nwhile (true) {\n  const { data } =\
-          \ await github.rest.actions.listWorkflowRunAnnotations({\n    owner, repo,\
-          \ run_id: runId, per_page: 100, page,\n  });\n  if (!data || data.length\
-          \ === 0) break;\n  annotations = annotations.concat(data);\n  if (data.length\
-          \ < 100) break;\n  page++;\n}\n\n// Filter annotations to those produced\
-          \ in the current job.\n// `job_name` is set on each annotation when the\
-          \ runner\n// resolves the workflow step context.\nconst jobAnnotations =\
-          \ annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
-    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'cms-marked-xss.shell_log'\n\
+        \  sarif_path = 'cms-marked-xss-results.sarif'\n  tool_name = 'cms-marked-xss'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-cms-marked-xss'\n  results = []\n  if os.path.exists(log_path):\n\
+        \      pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\\
+        d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for idx, line in enumerate(open(log_path,\
+        \ encoding='utf-8', errors='replace')):\n          m = pat.match(line.rstrip('\\\
+        n'))\n          if not m:\n              continue\n          level, path,\
+        \ sl, el, msg = m.groups()\n          sl = int(sl) if sl else 1\n        \
+        \  el = int(el) if el else sl\n          if level == 'error':\n          \
+        \    sarif_level = 'error'\n          else:\n              sarif_level = 'warning'\n\
+        \          msg = msg.strip()\n          slug = re.sub(r'[^a-z0-9]+', '-',\
+        \ (msg or 'finding').lower())[:50].strip('-')\n          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
+        \          results.append({\n              'ruleId': rule_id,\n          \
+        \    'level': sarif_level,\n              'message': {'text': msg or '(no\
+        \ message)'},\n              'locations': [{\n                  'physicalLocation':\
+        \ {\n                      'artifactLocation': {'uri': path or 'unknown'},\n\
+        \                      'region': {'startLine': sl, 'endLine': el},\n     \
+        \             },\n              }],\n          })\n  existing = {}\n  if os.path.exists(sarif_path)\
+        \ and os.path.getsize(sarif_path) > 0:\n      try:\n          existing = json.load(open(sarif_path,\
+        \ encoding='utf-8'))\n      except Exception:\n          existing = {}\n \
+        \ if not existing or 'runs' not in existing or not existing['runs']:\n   \
+        \   existing = {\n          'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
+    - name: Ensure cms-marked-xss-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
-        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
-        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s cms-marked-xss-results.sarif ]; then\n  echo \"::notice::cms-marked-xss\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        : {' \\\n    '          \"name\": \"cms-marked-xss\",' \\\n    '         \
+        \ \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
         ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
-        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
-    - name: Upload sast SARIF to GitHub Code Scanning
+        \n    '    }' \\\n    '  ]' \\\n    '}' > cms-marked-xss-results.sarif\nfi\n\
+        echo \"\u2713 cms-marked-xss-results.sarif size: $(stat -c%s cms-marked-xss-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload cms-marked-xss SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: sast-results.sarif
-        category: sast
-  multer-upload-validation:
+        sarif_file: cms-marked-xss-results.sarif
+        category: cms-marked-xss
+  multer-upload-hardening:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -139,121 +114,97 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: verify-multer-filefilter-and-limits
-      run: "set -e\nmkdir -p sarif-output\n# 1. Confirm multer is required somewhere\
-        \ in app code\nMULTER_REQUIRES=$(grep -rEn \"require\\(['\\\"]multer['\\\"\
-        ]\\)\" --include=\"*.js\" --exclude-dir=node_modules . || true)\nif [ -z \"\
-        $MULTER_REQUIRES\" ]; then\n  echo \"OK: multer not used in this codebase\
-        \ - skipping.\"\n  exit 0\nfi\necho \"$MULTER_REQUIRES\"\n# 2. Locate multer()\
-        \ instantiation sites (any of: multer({...}), multer().single(), multer().array())\n\
-        INSTANTIATIONS=$(grep -rEn \"multer\\s*\\(\" --include=\"*.js\" --exclude-dir=node_modules\
-        \ . || true)\necho \"$INSTANTIATIONS\"\n# 3. Check that EACH instantiation\
-        \ in app code defines fileFilter\nNO_FILEFILTER=$(grep -rEn \"multer\\s*\\\
-        (\" --include=\"*.js\" --exclude-dir=node_modules . | grep -v \"fileFilter\"\
-        \ | grep -v \"multer\\.diskStorage\\|multer\\.memoryStorage\" || true)\n#\
-        \ 4. Check that limits: {...} is set\nNO_LIMITS=$(grep -rEn \"multer\\s*\\\
-        (\" --include=\"*.js\" --exclude-dir=node_modules . | grep -v \"limits\" ||\
-        \ true)\nFAILED=0\nif [ -n \"$NO_FILEFILTER\" ]; then\n  echo \"::error title=Missing\
-        \ multer.fileFilter::multer() called without fileFilter - any file type can\
-        \ be uploaded\"\n  echo \"$NO_FILEFILTER\"\n  FAILED=1\nfi\nif [ -n \"$NO_LIMITS\"\
-        \ ]; then\n  echo \"::warning title=Missing multer.limits::multer() called\
-        \ without limits:{fileSize:...} - DoS via huge upload possible\"\n  echo \"\
-        $NO_LIMITS\"\n  FAILED=1\nfi\n# 5. Detect classic wildcard MIME bypass\nif\
-        \ grep -rEn \"fileFilter.*mimetype.*['\\\"]\\*/\\*['\\\"]|fileFilter.*mimetype.*['\\\
-        \"]image/\\*['\\\"]\" --include=\"*.js\" --exclude-dir=node_modules . ; then\n\
-        \  echo \"::error title=Weak multer MIME check::fileFilter uses wildcard image/*\
-        \ or */* - bypassable with polyglot files\"\n  FAILED=1\nfi\nexit $FAILED\n"
-    - name: multer-misconfig-inline-rule
-      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
-
-        echo ''Rule body:''
-
-        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
-
-
-        SEMGREP_EOF
-
-        '
-    - name: Convert sast annotations to SARIF
+    - name: audit-multer-filefilter-limits-and-extensions
+      run: "set -o pipefail\n{\nset -e\nUPLOAD=$(find src/routes src -maxdepth 3 -name\
+        \ 'upload*.js' 2>/dev/null | head -1)\nif [ -z \"$UPLOAD\" ]; then\n  echo\
+        \ \"::error::upload.js not located under src/routes - cannot audit multer\
+        \ config\"\n  exit 1\nfi\necho \"Auditing $UPLOAD\"\n\n# 1. fileFilter is\
+        \ mandatory\nif ! grep -qE 'fileFilter\\s*[:(]' \"$UPLOAD\"; then\n  echo\
+        \ \"::error file=$UPLOAD::multer instantiated without fileFilter - any MIME\
+        \ accepted\"\n  FOUND=1\nfi\n\n# 2. limits must cap fileSize to prevent DoS\n\
+        if ! grep -qE 'limits\\s*:\\s*\\{[^}]*fileSize' \"$UPLOAD\"; then\n  echo\
+        \ \"::error file=$UPLOAD::multer has no limits.fileSize - DoS via large uploads\"\
+        \n  FOUND=1\nfi\n\n# 3. Reject dangerous extensions in the allowlist (HTML/JS/SVG/EXE)\n\
+        if grep -qE \"['\\\"](js|mjs|html|htm|svg|exe|bat|cmd|sh|php|asp|aspx|jsp)['\\\
+        \"]\" \"$UPLOAD\"; then\n  echo \"::error file=$UPLOAD::Dangerous extension\
+        \ present in multer fileFilter allowlist\"\n  FOUND=1\nfi\n\n# 4. Static serving\
+        \ of upload dir must not use '*' route or root\nif grep -qE \"express\\.static\\\
+        ([^)]*['\\\"]\\\\.['\\\"]\" src/server.js 2>/dev/null; then\n  echo \"::error\
+        \ file=src/server.js::Static middleware serves whole directory - uploaded\
+        \ .html/.svg are executable\"\n  FOUND=1\nfi\n\n# 5. Filename should be randomised\
+        \ (no original name echo)\nif grep -qE 'filename\\s*:\\s*\\(.*file\\.originalname'\
+        \ \"$UPLOAD\"; then\n  echo \"::error file=$UPLOAD::diskStorage uses file.originalname\
+        \ verbatim - path traversal & overwrite risk\"\n  FOUND=1\nfi\n[ -z \"$FOUND\"\
+        \ ] && echo \"OK: multer upload route looks hardened\"\n} 2>&1 | tee -a multer-upload-hardening.shell_log\n"
+    - name: multer-missing-filefilter-inline-rule
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: blog-multer-no-filefilter\n\
+        \    languages: [javascript, typescript]\n    severity: ERROR\n    message:\
+        \ |\n      multer({...}) / multer.diskStorage({...}) in src/routes/upload.js\
+        \ is created\n      without a fileFilter. In this blog's image upload flow,\
+        \ attackers can upload\n      .svg (with embedded JS), .html, or .js files\
+        \ that get served from /public,\n      resulting in stored XSS (CWE-434) across\
+        \ all readers.\n    metadata:\n      category: security\n      cwe: \"CWE-434:\
+        \ Unrestricted Upload of File with Dangerous Type\"\n      technology: [express,\
+        \ multer]\n      confidence: HIGH\n    patterns:\n      - pattern-either:\n\
+        \          - pattern: multer({...})\n          - pattern: multer.diskStorage({...})\n\
+        \      - pattern-not: multer({fileFilter: $F, ...})\n      - pattern-not:\
+        \ multer.diskStorage({fileFilter: $F, ...})\nSEMGREP_EOF\n"
+    - name: Convert multer-upload-hardening shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: sast-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'sast';\nconst\
-          \ toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-sast';\n\n// Fetch all annotations for\
-          \ this run (max 100; for bigger\n// runs, paginate via per_page=100 + page=N).\n\
-          let annotations = [];\nlet page = 1;\nwhile (true) {\n  const { data } =\
-          \ await github.rest.actions.listWorkflowRunAnnotations({\n    owner, repo,\
-          \ run_id: runId, per_page: 100, page,\n  });\n  if (!data || data.length\
-          \ === 0) break;\n  annotations = annotations.concat(data);\n  if (data.length\
-          \ < 100) break;\n  page++;\n}\n\n// Filter annotations to those produced\
-          \ in the current job.\n// `job_name` is set on each annotation when the\
-          \ runner\n// resolves the workflow step context.\nconst jobAnnotations =\
-          \ annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
-    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'multer-upload-hardening.shell_log'\n\
+        \  sarif_path = 'multer-upload-hardening-results.sarif'\n  tool_name = 'multer-upload-hardening'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-multer-upload-hardening'\n  results = []\n\
+        \  if os.path.exists(log_path):\n      pat = re.compile(r'^::(error|warning)(?:\
+        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for\
+        \ idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \          m = pat.match(line.rstrip('\\n'))\n          if not m:\n      \
+        \        continue\n          level, path, sl, el, msg = m.groups()\n     \
+        \     sl = int(sl) if sl else 1\n          el = int(el) if el else sl\n  \
+        \        if level == 'error':\n              sarif_level = 'error'\n     \
+        \     else:\n              sarif_level = 'warning'\n          msg = msg.strip()\n\
+        \          slug = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n          results.append({\n\
+        \              'ruleId': rule_id,\n              'level': sarif_level,\n \
+        \             'message': {'text': msg or '(no message)'},\n              'locations':\
+        \ [{\n                  'physicalLocation': {\n                      'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                      'region': {'startLine':\
+        \ sl, 'endLine': el},\n                  },\n              }],\n         \
+        \ })\n  existing = {}\n  if os.path.exists(sarif_path) and os.path.getsize(sarif_path)\
+        \ > 0:\n      try:\n          existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \      except Exception:\n          existing = {}\n  if not existing or 'runs'\
+        \ not in existing or not existing['runs']:\n      existing = {\n         \
+        \ 'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
+    - name: Ensure multer-upload-hardening-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
-        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
-        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s multer-upload-hardening-results.sarif ]; then\n  echo \"::notice::multer-upload-hardening\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
-        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
-        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
-    - name: Upload sast SARIF to GitHub Code Scanning
+        : {' \\\n    '          \"name\": \"multer-upload-hardening\",' \\\n    '\
+        \          \"version\": \"0.65.0\",' \\\n    '          \"informationUri\"\
+        : \"https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '\
+        \      },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\
+        \n    '}' > multer-upload-hardening-results.sarif\nfi\necho \"\u2713 multer-upload-hardening-results.sarif\
+        \ size: $(stat -c%s multer-upload-hardening-results.sarif) bytes\"\n"
+    - name: Upload multer-upload-hardening SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: sast-results.sarif
-        category: sast
-  jwt-auth-hardening:
+        sarif_file: multer-upload-hardening-results.sarif
+        category: multer-upload-hardening
+  jwt-auth-config-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -262,118 +213,96 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: jwt-secret-and-expiry-check
-      run: "set -e\nmkdir -p sarif-output\n# 1. Verify jwt is actually used\nJWT_USAGE=$(grep\
-        \ -rEn \"jsonwebtoken|jwt\\.(sign|verify|decode)\" --include=\"*.js\" --exclude-dir=node_modules\
-        \ . || true)\nif [ -z \"$JWT_USAGE\" ]; then\n  echo \"OK: jsonwebtoken not\
-        \ used - skipping.\"\n  exit 0\nfi\necho \"$JWT_USAGE\"\nFAILED=0\n# 2. Detect\
-        \ algorithm: 'none' anywhere\nif grep -rEn \"algorithm\\s*:\\s*['\\\"]none['\\\
-        \"]|algorithms\\s*:\\s*\\[['\\\"]none['\\\"]\" --include=\"*.js\" --exclude-dir=node_modules\
-        \ . ; then\n  echo \"::error title=JWT alg=none::algorithm: 'none' is forbidden\
-        \ (CWE-347)\"\n  FAILED=1\nfi\n# 3. Detect jwt.sign calls missing expiresIn\
-        \ (rough heuristic)\nif grep -rEn \"jwt\\.sign\\(\" --include=\"*.js\" --exclude-dir=node_modules\
-        \ . | grep -v \"expiresIn\\|expires_in\" ; then\n  echo \"::warning title=JWT\
-        \ missing expiresIn::jwt.sign() call without expiresIn - tokens never expire\"\
-        \n  FAILED=1\nfi\n# 4. Detect hard-coded JWT secrets / fallbacks\nif grep\
-        \ -rEn \"(JWT_SECRET|jwtSecret|jwt_secret)\\s*[:=]\\s*['\\\"][^'\\\"]+['\\\
-        \"]\" --include=\"*.js\" --exclude-dir=node_modules . ; then\n  echo \"::error\
-        \ title=Hardcoded JWT secret::JWT secret appears to be hard-coded - rotate\
-        \ and source from env/secret manager\"\n  FAILED=1\nfi\n# 5. Detect jwt.verify\
-        \ missing algorithms whitelist\nif grep -rEn \"jwt\\.verify\\(\" --include=\"\
-        *.js\" --exclude-dir=node_modules . | grep -v \"algorithms\\s*:\" ; then\n\
-        \  echo \"::warning title=JWT verify without algorithms::jwt.verify() should\
-        \ pin algorithms: ['HS256'] (CWE-347 algorithm confusion)\"\n  FAILED=1\n\
-        fi\nexit $FAILED\n"
-    - name: jwt-unsafe-verify-inline-rule
-      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
-
-        echo ''Rule body:''
-
-        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
-
-
-        SEMGREP_EOF
-
-        '
-    - name: Convert sast annotations to SARIF
+    - name: verify-jwt-algorithms-expiry-and-secret-strength
+      run: "set -o pipefail\n{\nset -e\nAUTH=$(find src/routes src -maxdepth 3 -name\
+        \ 'auth*.js' 2>/dev/null | head -1)\nif [ -z \"$AUTH\" ]; then\n  echo \"\
+        ::error::routes/auth.js not found\"\n  exit 1\nfi\necho \"Auditing $AUTH\"\
+        \n\n# 1. jwt.verify must pin allowed algorithms\nif ! grep -qE 'jwt\\.verify\\\
+        s*\\([^)]*\\{[^{}]*algorithms' \"$AUTH\"; then\n  echo \"::error file=$AUTH::jwt.verify()\
+        \ invoked without algorithms whitelist - alg=none / confusion attack possible\"\
+        \n  FOUND=1\nfi\n\n# 2. Tokens must expire\nif ! grep -qE 'expiresIn\\s*:'\
+        \ \"$AUTH\"; then\n  echo \"::error file=$AUTH::No expiresIn set on JWT -\
+        \ leaked tokens valid forever\"\n  FOUND=1\nfi\n\n# 3. No jwt.verify using\
+        \ 'none' or empty key\nif grep -qE \"jwt\\.verify\\s*\\([^,]+,\\s*(''|null|undefined|'none'|\"\
+        .none.\")\" \"$AUTH\"; then\n  echo \"::error file=$AUTH::jwt.verify() called\
+        \ with empty/disabled key\"\n  FOUND=1\nfi\n\n# 4. JWT_SECRET must not be\
+        \ a short literal in source\nif grep -rEn \"JWT_SECRET\\s*=\\s*['\\\"][^'\\\
+        \"]{0,31}['\\\"]\" src/ 2>/dev/null; then\n  echo \"::error file=src/**:JWT_SECRET\
+        \ appears as short hard-coded literal (<32 chars) - offline brute-force risk\"\
+        \n  FOUND=1\nfi\n\n# 5. Token must not be stored where XSS can steal it (localStorage)\n\
+        if grep -rEn 'localStorage\\.setItem\\s*\\(\\s*[\"\\']token' src/views/ views/\
+        \ public/ 2>/dev/null; then\n  echo \"::error::JWT stored in localStorage\
+        \ - XSS-stealable; use httpOnly cookie\"\n  FOUND=1\nfi\n[ -z \"$FOUND\" ]\
+        \ && echo \"OK: JWT auth configuration looks hardened\"\n} 2>&1 | tee -a jwt-auth-config.shell_log\n"
+    - name: jwt-verify-no-algorithm-inline-rule
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: blog-jwt-verify-missing-algorithms\n\
+        \    languages: [javascript, typescript]\n    severity: ERROR\n    message:\
+        \ |\n      jwt.verify() in src/routes/auth.js called without {algorithms:[...]}\
+        \ whitelist.\n      The blog uses these tokens to attribute comments and post\
+        \ edits, so attackers\n      can forge admin/mod tokens via the 'alg: none'\
+        \ attack or HS256/RS256 confusion\n      (CWE-347: Improper Verification of\
+        \ Cryptographic Signature).\n    metadata:\n      category: security\n   \
+        \   cwe: \"CWE-347: Improper Verification of Cryptographic Signature\"\n \
+        \     technology: [express, jsonwebtoken]\n      confidence: HIGH\n    patterns:\n\
+        \      - pattern-either:\n          - pattern: jwt.verify($TOKEN, $SECRET)\n\
+        \          - pattern: jwt.verify($TOKEN, $SECRET, $CB)\n          - pattern:\
+        \ jwt.verify($TOKEN, $SECRET, {expiresIn: $E})\n      - pattern-not: jwt.verify($TOKEN,\
+        \ $SECRET, {algorithms: $A, ...})\n      - pattern-not: jwt.verify($TOKEN,\
+        \ $SECRET, {algorithms: $A, ...}, $CB)\nSEMGREP_EOF\n"
+    - name: Convert jwt-auth-config shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: sast-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'sast';\nconst\
-          \ toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-sast';\n\n// Fetch all annotations for\
-          \ this run (max 100; for bigger\n// runs, paginate via per_page=100 + page=N).\n\
-          let annotations = [];\nlet page = 1;\nwhile (true) {\n  const { data } =\
-          \ await github.rest.actions.listWorkflowRunAnnotations({\n    owner, repo,\
-          \ run_id: runId, per_page: 100, page,\n  });\n  if (!data || data.length\
-          \ === 0) break;\n  annotations = annotations.concat(data);\n  if (data.length\
-          \ < 100) break;\n  page++;\n}\n\n// Filter annotations to those produced\
-          \ in the current job.\n// `job_name` is set on each annotation when the\
-          \ runner\n// resolves the workflow step context.\nconst jobAnnotations =\
-          \ annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
-    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'jwt-auth-config.shell_log'\n\
+        \  sarif_path = 'jwt-auth-config-results.sarif'\n  tool_name = 'jwt-auth-config'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-jwt-auth-config'\n  results = []\n  if os.path.exists(log_path):\n\
+        \      pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\\
+        d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for idx, line in enumerate(open(log_path,\
+        \ encoding='utf-8', errors='replace')):\n          m = pat.match(line.rstrip('\\\
+        n'))\n          if not m:\n              continue\n          level, path,\
+        \ sl, el, msg = m.groups()\n          sl = int(sl) if sl else 1\n        \
+        \  el = int(el) if el else sl\n          if level == 'error':\n          \
+        \    sarif_level = 'error'\n          else:\n              sarif_level = 'warning'\n\
+        \          msg = msg.strip()\n          slug = re.sub(r'[^a-z0-9]+', '-',\
+        \ (msg or 'finding').lower())[:50].strip('-')\n          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
+        \          results.append({\n              'ruleId': rule_id,\n          \
+        \    'level': sarif_level,\n              'message': {'text': msg or '(no\
+        \ message)'},\n              'locations': [{\n                  'physicalLocation':\
+        \ {\n                      'artifactLocation': {'uri': path or 'unknown'},\n\
+        \                      'region': {'startLine': sl, 'endLine': el},\n     \
+        \             },\n              }],\n          })\n  existing = {}\n  if os.path.exists(sarif_path)\
+        \ and os.path.getsize(sarif_path) > 0:\n      try:\n          existing = json.load(open(sarif_path,\
+        \ encoding='utf-8'))\n      except Exception:\n          existing = {}\n \
+        \ if not existing or 'runs' not in existing or not existing['runs']:\n   \
+        \   existing = {\n          'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
+    - name: Ensure jwt-auth-config-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
-        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
-        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s jwt-auth-config-results.sarif ]; then\n  echo \"::notice::jwt-auth-config\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        : {' \\\n    '          \"name\": \"jwt-auth-config\",' \\\n    '        \
+        \  \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
         ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
-        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
-    - name: Upload sast SARIF to GitHub Code Scanning
+        \n    '    }' \\\n    '  ]' \\\n    '}' > jwt-auth-config-results.sarif\n\
+        fi\necho \"\u2713 jwt-auth-config-results.sarif size: $(stat -c%s jwt-auth-config-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload jwt-auth-config SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: sast-results.sarif
-        category: sast
+        sarif_file: jwt-auth-config-results.sarif
+        category: jwt-auth-config
   blog-markdown-sanitize:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -384,75 +313,50 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-markdown-no-sanitize
-      run: "set -e\nfail=0\n# Find marked() or markdown-it usage\nif grep -rnE 'marked\\\
-        s*\\(' src/ 2>/dev/null | grep -vE 'DOMPurify|sanitize' | grep -q .; then\n\
-        \  echo '::error file=src/utils/markdown.js::marked() called without DOMPurify.sanitize\
-        \ \u2014 XSS via markdown'\n  fail=1\nfi\n# Find innerHTML with user content\n\
-        if grep -rnE 'innerHTML\\s*=\\s*\\$\\{?\\s*(content|post|comment|body)' src/\
-        \ 2>/dev/null | grep -q .; then\n  echo '::error file=src/routes/posts.js::innerHTML\
-        \ assigned from user content \u2014 use textContent or DOMPurify'\n  fail=1\n\
-        fi\nexit $fail\n"
-    - name: Convert blog-markdown-xss annotations to SARIF
+      run: "set -o pipefail\n{\nset -e\nfail=0\n# Find marked() or markdown-it usage\n\
+        if grep -rnE 'marked\\s*\\(' src/ 2>/dev/null | grep -vE 'DOMPurify|sanitize'\
+        \ | grep -q .; then\n  echo '::error file=src/utils/markdown.js::marked()\
+        \ called without DOMPurify.sanitize \u2014 XSS via markdown'\n  fail=1\nfi\n\
+        # Find innerHTML with user content\nif grep -rnE 'innerHTML\\s*=\\s*\\$\\\
+        {?\\s*(content|post|comment|body)' src/ 2>/dev/null | grep -q .; then\n  echo\
+        \ '::error file=src/routes/posts.js::innerHTML assigned from user content\
+        \ \u2014 use textContent or DOMPurify'\n  fail=1\nfi\nexit $fail\n} 2>&1 |\
+        \ tee -a blog-markdown-xss.shell_log\n"
+    - name: Convert blog-markdown-xss shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: blog-markdown-xss-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'blog-markdown-xss';\n\
-          const toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-blog-markdown-xss';\n\n// Fetch all annotations\
-          \ for this run (max 100; for bigger\n// runs, paginate via per_page=100\
-          \ + page=N).\nlet annotations = [];\nlet page = 1;\nwhile (true) {\n  const\
-          \ { data } = await github.rest.actions.listWorkflowRunAnnotations({\n  \
-          \  owner, repo, run_id: runId, per_page: 100, page,\n  });\n  if (!data\
-          \ || data.length === 0) break;\n  annotations = annotations.concat(data);\n\
-          \  if (data.length < 100) break;\n  page++;\n}\n\n// Filter annotations\
-          \ to those produced in the current job.\n// `job_name` is set on each annotation\
-          \ when the runner\n// resolves the workflow step context.\nconst jobAnnotations\
-          \ = annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'blog-markdown-xss.shell_log'\n\
+        \  sarif_path = 'blog-markdown-xss-results.sarif'\n  tool_name = 'blog-markdown-xss'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-blog-markdown-xss'\n  results = []\n  if\
+        \ os.path.exists(log_path):\n      pat = re.compile(r'^::(error|warning)(?:\
+        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for\
+        \ idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \          m = pat.match(line.rstrip('\\n'))\n          if not m:\n      \
+        \        continue\n          level, path, sl, el, msg = m.groups()\n     \
+        \     sl = int(sl) if sl else 1\n          el = int(el) if el else sl\n  \
+        \        if level == 'error':\n              sarif_level = 'error'\n     \
+        \     else:\n              sarif_level = 'warning'\n          msg = msg.strip()\n\
+        \          slug = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n          results.append({\n\
+        \              'ruleId': rule_id,\n              'level': sarif_level,\n \
+        \             'message': {'text': msg or '(no message)'},\n              'locations':\
+        \ [{\n                  'physicalLocation': {\n                      'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                      'region': {'startLine':\
+        \ sl, 'endLine': el},\n                  },\n              }],\n         \
+        \ })\n  existing = {}\n  if os.path.exists(sarif_path) and os.path.getsize(sarif_path)\
+        \ > 0:\n      try:\n          existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \      except Exception:\n          existing = {}\n  if not existing or 'runs'\
+        \ not in existing or not existing['runs']:\n      existing = {\n         \
+        \ 'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
     - name: Ensure blog-markdown-xss-results.sarif exists (fallback for 0 findings)
       if: always()
       run: "if [ ! -s blog-markdown-xss-results.sarif ]; then\n  echo \"::notice::blog-markdown-xss\
@@ -482,71 +386,45 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-comment-csrf-auth
-      run: "set -e\nfail=0\n# Check CSRF middleware present\nif ! grep -rnE '(csurf|csrf\\\
-        (\\)|doubleCsrf)' src/ 2>/dev/null | grep -q .; then\n  echo '::warning file=src/server.js::No\
-        \ CSRF protection detected \u2014 install csurf or double-submit cookie pattern'\n\
-        \  fail=1\nfi\nexit $fail\n"
-    - name: Convert blog-csrf annotations to SARIF
+      run: "set -o pipefail\n{\nset -e\nfail=0\n# Check CSRF middleware present\n\
+        if ! grep -rnE '(csurf|csrf\\(\\)|doubleCsrf)' src/ 2>/dev/null | grep -q\
+        \ .; then\n  echo '::warning file=src/server.js::No CSRF protection detected\
+        \ \u2014 install csurf or double-submit cookie pattern'\n  fail=1\nfi\nexit\
+        \ $fail\n} 2>&1 | tee -a blog-csrf.shell_log\n"
+    - name: Convert blog-csrf shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: blog-csrf-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'blog-csrf';\n\
-          const toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-blog-csrf';\n\n// Fetch all annotations\
-          \ for this run (max 100; for bigger\n// runs, paginate via per_page=100\
-          \ + page=N).\nlet annotations = [];\nlet page = 1;\nwhile (true) {\n  const\
-          \ { data } = await github.rest.actions.listWorkflowRunAnnotations({\n  \
-          \  owner, repo, run_id: runId, per_page: 100, page,\n  });\n  if (!data\
-          \ || data.length === 0) break;\n  annotations = annotations.concat(data);\n\
-          \  if (data.length < 100) break;\n  page++;\n}\n\n// Filter annotations\
-          \ to those produced in the current job.\n// `job_name` is set on each annotation\
-          \ when the runner\n// resolves the workflow step context.\nconst jobAnnotations\
-          \ = annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'blog-csrf.shell_log'\n\
+        \  sarif_path = 'blog-csrf-results.sarif'\n  tool_name = 'blog-csrf'\n  tool_version\
+        \ = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-blog-csrf'\n  results = []\n  if os.path.exists(log_path):\n\
+        \      pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\\
+        d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for idx, line in enumerate(open(log_path,\
+        \ encoding='utf-8', errors='replace')):\n          m = pat.match(line.rstrip('\\\
+        n'))\n          if not m:\n              continue\n          level, path,\
+        \ sl, el, msg = m.groups()\n          sl = int(sl) if sl else 1\n        \
+        \  el = int(el) if el else sl\n          if level == 'error':\n          \
+        \    sarif_level = 'error'\n          else:\n              sarif_level = 'warning'\n\
+        \          msg = msg.strip()\n          slug = re.sub(r'[^a-z0-9]+', '-',\
+        \ (msg or 'finding').lower())[:50].strip('-')\n          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
+        \          results.append({\n              'ruleId': rule_id,\n          \
+        \    'level': sarif_level,\n              'message': {'text': msg or '(no\
+        \ message)'},\n              'locations': [{\n                  'physicalLocation':\
+        \ {\n                      'artifactLocation': {'uri': path or 'unknown'},\n\
+        \                      'region': {'startLine': sl, 'endLine': el},\n     \
+        \             },\n              }],\n          })\n  existing = {}\n  if os.path.exists(sarif_path)\
+        \ and os.path.getsize(sarif_path) > 0:\n      try:\n          existing = json.load(open(sarif_path,\
+        \ encoding='utf-8'))\n      except Exception:\n          existing = {}\n \
+        \ if not existing or 'runs' not in existing or not existing['runs']:\n   \
+        \   existing = {\n          'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
     - name: Ensure blog-csrf-results.sarif exists (fallback for 0 findings)
       if: always()
       run: "if [ ! -s blog-csrf-results.sarif ]; then\n  echo \"::notice::blog-csrf\
@@ -576,71 +454,44 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-csp-headers
-      run: "set -e\nfail=0\n# Check helmet middleware\nif ! grep -rnE 'helmet\\s*\\\
-        (' src/ 2>/dev/null | grep -q .; then\n  echo '::warning file=src/server.js::helmet()\
-        \ middleware missing \u2014 CSP/HSTS/X-Frame-Options not set'\n  fail=1\n\
-        fi\nexit $fail\n"
-    - name: Convert blog-csp annotations to SARIF
+      run: "set -o pipefail\n{\nset -e\nfail=0\n# Check helmet middleware\nif ! grep\
+        \ -rnE 'helmet\\s*\\(' src/ 2>/dev/null | grep -q .; then\n  echo '::warning\
+        \ file=src/server.js::helmet() middleware missing \u2014 CSP/HSTS/X-Frame-Options\
+        \ not set'\n  fail=1\nfi\nexit $fail\n} 2>&1 | tee -a blog-csp.shell_log\n"
+    - name: Convert blog-csp shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: blog-csp-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'blog-csp';\n\
-          const toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-blog-csp';\n\n// Fetch all annotations\
-          \ for this run (max 100; for bigger\n// runs, paginate via per_page=100\
-          \ + page=N).\nlet annotations = [];\nlet page = 1;\nwhile (true) {\n  const\
-          \ { data } = await github.rest.actions.listWorkflowRunAnnotations({\n  \
-          \  owner, repo, run_id: runId, per_page: 100, page,\n  });\n  if (!data\
-          \ || data.length === 0) break;\n  annotations = annotations.concat(data);\n\
-          \  if (data.length < 100) break;\n  page++;\n}\n\n// Filter annotations\
-          \ to those produced in the current job.\n// `job_name` is set on each annotation\
-          \ when the runner\n// resolves the workflow step context.\nconst jobAnnotations\
-          \ = annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'blog-csp.shell_log'\n\
+        \  sarif_path = 'blog-csp-results.sarif'\n  tool_name = 'blog-csp'\n  tool_version\
+        \ = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-blog-csp'\n  results = []\n  if os.path.exists(log_path):\n\
+        \      pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\\
+        d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for idx, line in enumerate(open(log_path,\
+        \ encoding='utf-8', errors='replace')):\n          m = pat.match(line.rstrip('\\\
+        n'))\n          if not m:\n              continue\n          level, path,\
+        \ sl, el, msg = m.groups()\n          sl = int(sl) if sl else 1\n        \
+        \  el = int(el) if el else sl\n          if level == 'error':\n          \
+        \    sarif_level = 'error'\n          else:\n              sarif_level = 'warning'\n\
+        \          msg = msg.strip()\n          slug = re.sub(r'[^a-z0-9]+', '-',\
+        \ (msg or 'finding').lower())[:50].strip('-')\n          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
+        \          results.append({\n              'ruleId': rule_id,\n          \
+        \    'level': sarif_level,\n              'message': {'text': msg or '(no\
+        \ message)'},\n              'locations': [{\n                  'physicalLocation':\
+        \ {\n                      'artifactLocation': {'uri': path or 'unknown'},\n\
+        \                      'region': {'startLine': sl, 'endLine': el},\n     \
+        \             },\n              }],\n          })\n  existing = {}\n  if os.path.exists(sarif_path)\
+        \ and os.path.getsize(sarif_path) > 0:\n      try:\n          existing = json.load(open(sarif_path,\
+        \ encoding='utf-8'))\n      except Exception:\n          existing = {}\n \
+        \ if not existing or 'runs' not in existing or not existing['runs']:\n   \
+        \   existing = {\n          'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
     - name: Ensure blog-csp-results.sarif exists (fallback for 0 findings)
       if: always()
       run: "if [ ! -s blog-csp-results.sarif ]; then\n  echo \"::notice::blog-csp\
@@ -670,75 +521,50 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-multer-config
-      run: "set -e\nfail=0\n# Check multer config: fileFilter present\nif grep -rnE\
-        \ \"multer\\s*\\(\" src/ 2>/dev/null | grep -q .; then\n  if ! grep -rnE 'fileFilter'\
-        \ src/ 2>/dev/null | grep -q .; then\n    echo '::error file=src/middleware/upload.js::multer()\
-        \ missing fileFilter \u2014 accepts any file type, risk of RCE via polyglot\
-        \ file'\n    fail=1\n  fi\n  # Check size limit\n  if ! grep -rnE 'limits.*fileSize'\
-        \ src/ 2>/dev/null | grep -q .; then\n    echo '::warning file=src/middleware/upload.js::multer()\
+      run: "set -o pipefail\n{\nset -e\nfail=0\n# Check multer config: fileFilter\
+        \ present\nif grep -rnE \"multer\\s*\\(\" src/ 2>/dev/null | grep -q .; then\n\
+        \  if ! grep -rnE 'fileFilter' src/ 2>/dev/null | grep -q .; then\n    echo\
+        \ '::error file=src/middleware/upload.js::multer() missing fileFilter \u2014\
+        \ accepts any file type, risk of RCE via polyglot file'\n    fail=1\n  fi\n\
+        \  # Check size limit\n  if ! grep -rnE 'limits.*fileSize' src/ 2>/dev/null\
+        \ | grep -q .; then\n    echo '::warning file=src/middleware/upload.js::multer()\
         \ missing limits.fileSize \u2014 no DoS protection on large uploads'\n   \
-        \ fail=1\n  fi\nfi\nexit $fail\n"
-    - name: Convert blog-multer-hardening annotations to SARIF
+        \ fail=1\n  fi\nfi\nexit $fail\n} 2>&1 | tee -a blog-multer-hardening.shell_log\n"
+    - name: Convert blog-multer-hardening shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: blog-multer-hardening-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'blog-multer-hardening';\n\
-          const toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-blog-multer-hardening';\n\n// Fetch all\
-          \ annotations for this run (max 100; for bigger\n// runs, paginate via per_page=100\
-          \ + page=N).\nlet annotations = [];\nlet page = 1;\nwhile (true) {\n  const\
-          \ { data } = await github.rest.actions.listWorkflowRunAnnotations({\n  \
-          \  owner, repo, run_id: runId, per_page: 100, page,\n  });\n  if (!data\
-          \ || data.length === 0) break;\n  annotations = annotations.concat(data);\n\
-          \  if (data.length < 100) break;\n  page++;\n}\n\n// Filter annotations\
-          \ to those produced in the current job.\n// `job_name` is set on each annotation\
-          \ when the runner\n// resolves the workflow step context.\nconst jobAnnotations\
-          \ = annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'blog-multer-hardening.shell_log'\n\
+        \  sarif_path = 'blog-multer-hardening-results.sarif'\n  tool_name = 'blog-multer-hardening'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-blog-multer-hardening'\n  results = []\n\
+        \  if os.path.exists(log_path):\n      pat = re.compile(r'^::(error|warning)(?:\
+        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for\
+        \ idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \          m = pat.match(line.rstrip('\\n'))\n          if not m:\n      \
+        \        continue\n          level, path, sl, el, msg = m.groups()\n     \
+        \     sl = int(sl) if sl else 1\n          el = int(el) if el else sl\n  \
+        \        if level == 'error':\n              sarif_level = 'error'\n     \
+        \     else:\n              sarif_level = 'warning'\n          msg = msg.strip()\n\
+        \          slug = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n          results.append({\n\
+        \              'ruleId': rule_id,\n              'level': sarif_level,\n \
+        \             'message': {'text': msg or '(no message)'},\n              'locations':\
+        \ [{\n                  'physicalLocation': {\n                      'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                      'region': {'startLine':\
+        \ sl, 'endLine': el},\n                  },\n              }],\n         \
+        \ })\n  existing = {}\n  if os.path.exists(sarif_path) and os.path.getsize(sarif_path)\
+        \ > 0:\n      try:\n          existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \      except Exception:\n          existing = {}\n  if not existing or 'runs'\
+        \ not in existing or not existing['runs']:\n      existing = {\n         \
+        \ 'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
     - name: Ensure blog-multer-hardening-results.sarif exists (fallback for 0 findings)
       if: always()
       run: "if [ ! -s blog-multer-hardening-results.sarif ]; then\n  echo \"::notice::blog-multer-hardening\
@@ -768,75 +594,49 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-jwt-weak-secret
-      run: "set -e\nfail=0\n# JWT secret must come from env, not literal\nif grep\
-        \ -rnE 'jwt\\.sign\\s*\\([^,]+,\\s*[\"\\'][A-Za-z0-9]{1,31}[\"\\']' src/ 2>/dev/null\
-        \ | grep -q .; then\n  echo '::error file=src/auth/jwt.ts::JWT signed with\
-        \ short/hardcoded secret \u2014 use process.env.JWT_SECRET (>= 32 bytes)'\n\
-        \  fail=1\nfi\n# 'none' algorithm forbidden\nif grep -rnE 'algorithm.*none|algorithms.*\\\
+      run: "set -o pipefail\n{\nset -e\nfail=0\n# JWT secret must come from env, not\
+        \ literal\nif grep -rnE 'jwt\\.sign\\s*\\([^,]+,\\s*[\"\\'][A-Za-z0-9]{1,31}[\"\
+        \\']' src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/auth/jwt.ts::JWT\
+        \ signed with short/hardcoded secret \u2014 use process.env.JWT_SECRET (>=\
+        \ 32 bytes)'\n  fail=1\nfi\n# 'none' algorithm forbidden\nif grep -rnE 'algorithm.*none|algorithms.*\\\
         [.*none' src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/auth/jwt.ts::JWT\
         \ verify accepts alg=none \u2014 algorithm confusion attack (CVE-2015-9235)'\n\
-        \  fail=1\nfi\nexit $fail\n"
-    - name: Convert blog-jwt-hardening annotations to SARIF
+        \  fail=1\nfi\nexit $fail\n} 2>&1 | tee -a blog-jwt-hardening.shell_log\n"
+    - name: Convert blog-jwt-hardening shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: blog-jwt-hardening-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'blog-jwt-hardening';\n\
-          const toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-blog-jwt-hardening';\n\n// Fetch all\
-          \ annotations for this run (max 100; for bigger\n// runs, paginate via per_page=100\
-          \ + page=N).\nlet annotations = [];\nlet page = 1;\nwhile (true) {\n  const\
-          \ { data } = await github.rest.actions.listWorkflowRunAnnotations({\n  \
-          \  owner, repo, run_id: runId, per_page: 100, page,\n  });\n  if (!data\
-          \ || data.length === 0) break;\n  annotations = annotations.concat(data);\n\
-          \  if (data.length < 100) break;\n  page++;\n}\n\n// Filter annotations\
-          \ to those produced in the current job.\n// `job_name` is set on each annotation\
-          \ when the runner\n// resolves the workflow step context.\nconst jobAnnotations\
-          \ = annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'blog-jwt-hardening.shell_log'\n\
+        \  sarif_path = 'blog-jwt-hardening-results.sarif'\n  tool_name = 'blog-jwt-hardening'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-blog-jwt-hardening'\n  results = []\n  if\
+        \ os.path.exists(log_path):\n      pat = re.compile(r'^::(error|warning)(?:\
+        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for\
+        \ idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \          m = pat.match(line.rstrip('\\n'))\n          if not m:\n      \
+        \        continue\n          level, path, sl, el, msg = m.groups()\n     \
+        \     sl = int(sl) if sl else 1\n          el = int(el) if el else sl\n  \
+        \        if level == 'error':\n              sarif_level = 'error'\n     \
+        \     else:\n              sarif_level = 'warning'\n          msg = msg.strip()\n\
+        \          slug = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n          results.append({\n\
+        \              'ruleId': rule_id,\n              'level': sarif_level,\n \
+        \             'message': {'text': msg or '(no message)'},\n              'locations':\
+        \ [{\n                  'physicalLocation': {\n                      'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                      'region': {'startLine':\
+        \ sl, 'endLine': el},\n                  },\n              }],\n         \
+        \ })\n  existing = {}\n  if os.path.exists(sarif_path) and os.path.getsize(sarif_path)\
+        \ > 0:\n      try:\n          existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \      except Exception:\n          existing = {}\n  if not existing or 'runs'\
+        \ not in existing or not existing['runs']:\n      existing = {\n         \
+        \ 'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
     - name: Ensure blog-jwt-hardening-results.sarif exists (fallback for 0 findings)
       if: always()
       run: "if [ ! -s blog-jwt-hardening-results.sarif ]; then\n  echo \"::notice::blog-jwt-hardening\
@@ -866,72 +666,47 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-open-redirect
-      run: "set -e\nfail=0\n# Look for direct res.redirect(req.query.*) without validation\n\
-        if grep -rnE 'res\\.redirect\\s*\\(\\s*req\\.query\\.(next|returnTo|redirect|url)'\
-        \ src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/routes/auth.js::res.redirect\
-        \ uses unvalidated user input \u2014 open-redirect phishing vector (CWE-601)'\n\
-        \  fail=1\nfi\nexit $fail\n"
-    - name: Convert blog-open-redirect annotations to SARIF
+      run: "set -o pipefail\n{\nset -e\nfail=0\n# Look for direct res.redirect(req.query.*)\
+        \ without validation\nif grep -rnE 'res\\.redirect\\s*\\(\\s*req\\.query\\\
+        .(next|returnTo|redirect|url)' src/ 2>/dev/null | grep -q .; then\n  echo\
+        \ '::error file=src/routes/auth.js::res.redirect uses unvalidated user input\
+        \ \u2014 open-redirect phishing vector (CWE-601)'\n  fail=1\nfi\nexit $fail\n\
+        } 2>&1 | tee -a blog-open-redirect.shell_log\n"
+    - name: Convert blog-open-redirect shell_check annotations to SARIF
       if: always()
-      env:
-        SARIF_PATH: blog-open-redirect-results.sarif
-      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
-      with:
-        script: "const { owner, repo } = context.repo;\nconst runId = context.runId;\n\
-          const jobName = context.job;\nconst fs = require('fs');\nconst path = require('path');\n\
-          const sarifPath = process.env.SARIF_PATH;\nconst toolName = 'blog-open-redirect';\n\
-          const toolVersion = '1.0.0';\nconst informationUri = 'https://github.com/iqbalrsyd/ai-devsecops';\n\
-          const ruleIdPrefix = 'ai-devsecops-blog-open-redirect';\n\n// Fetch all\
-          \ annotations for this run (max 100; for bigger\n// runs, paginate via per_page=100\
-          \ + page=N).\nlet annotations = [];\nlet page = 1;\nwhile (true) {\n  const\
-          \ { data } = await github.rest.actions.listWorkflowRunAnnotations({\n  \
-          \  owner, repo, run_id: runId, per_page: 100, page,\n  });\n  if (!data\
-          \ || data.length === 0) break;\n  annotations = annotations.concat(data);\n\
-          \  if (data.length < 100) break;\n  page++;\n}\n\n// Filter annotations\
-          \ to those produced in the current job.\n// `job_name` is set on each annotation\
-          \ when the runner\n// resolves the workflow step context.\nconst jobAnnotations\
-          \ = annotations.filter(a => a.job_name === jobName);\nif (jobAnnotations.length\
-          \ === 0) {\n  core.info(`No annotations found for job ${jobName}; SARIF\
-          \ generation skipped.`);\n  // Ensure the SARIF file exists (so upload-sarif\
-          \ does not\n  // fail with \"Path does not exist\"). The fallback step may\n\
-          \  // have already created an empty one.\n  if (!fs.existsSync(sarifPath))\
-          \ {\n    fs.writeFileSync(sarifPath, JSON.stringify({\n      version: '2.1.0',\n\
-          \      $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n     \
-          \ runs: [{ tool: { driver: { name: toolName, version: toolVersion, informationUri\
-          \ } }, results: [] }],\n    }, null, 2));\n  }\n  return;\n}\n\n// Map each\
-          \ annotation to a SARIF result. Annotations look like:\n//   { path: 'src/server.js',\
-          \ start_line: 33, end_line: 33,\n//     annotation_level: 'warning' | 'failure',\n\
-          //     message: 'No CSRF protection detected \u2026' }\n// GitHub sets `annotation_level='failure'`\
-          \ for `::error` and\n// `'warning'` for `::warning`. We map both to SARIF\
-          \ results\n// with severity WARNING (warning) or ERROR (failure).\nconst\
-          \ levelMap = { failure: 'error', warning: 'warning' };\nconst results =\
-          \ jobAnnotations.map((a, idx) => {\n  const level = levelMap[a.annotation_level]\
-          \ || 'note';\n  // Build a stable rule id from the tool + path + first word\
-          \ of\n  // the message. This keeps alerts deduped across runs.\n  const\
-          \ slug = (a.message || 'finding').toLowerCase()\n    .replace(/[^a-z0-9]+/g,\
-          \ '-').replace(/^-+|-+$/g, '').slice(0, 40);\n  const ruleId = `${ruleIdPrefix}-${slug}-${a.start_line\
-          \ || 0}-${idx}`;\n  return {\n    ruleId,\n    level,\n    message: { text:\
-          \ a.message || '(no message)' },\n    locations: [{\n      physicalLocation:\
-          \ {\n        artifactLocation: { uri: a.path || 'unknown' },\n        region:\
-          \ { startLine: a.start_line || 1, endLine: a.end_line || a.start_line ||\
-          \ 1 },\n      },\n    }],\n  };\n});\n\n// Build the SARIF document. If\
-          \ the file already exists (from\n// an earlier scanner or the fallback),\
-          \ merge results into the\n// first run; otherwise create a fresh document.\n\
-          let doc;\nif (fs.existsSync(sarifPath)) {\n  try {\n    doc = JSON.parse(fs.readFileSync(sarifPath,\
-          \ 'utf8'));\n  } catch (e) {\n    core.warning(`Existing SARIF at ${sarifPath}\
-          \ is not valid JSON; regenerating.`);\n    doc = null;\n  }\n}\nif (!doc\
-          \ || !Array.isArray(doc.runs) || doc.runs.length === 0) {\n  doc = {\n \
-          \   version: '2.1.0',\n    $schema: 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-          \    runs: [{\n      tool: { driver: { name: toolName, version: toolVersion,\
-          \ informationUri, rules: [] } },\n      results: [],\n    }],\n  };\n}\n\
-          // Ensure the first run's driver.name matches our tool (so the\n// Code\
-          \ Scanning tab attributes the alerts to this job's\n// scanner rather than\
-          \ the fallback's empty driver).\ndoc.runs[0].tool.driver.name = toolName;\n\
-          doc.runs[0].tool.driver.version = toolVersion;\ndoc.runs[0].tool.driver.informationUri\
-          \ = informationUri;\ndoc.runs[0].results = (doc.runs[0].results || []).concat(results);\n\
-          \nfs.writeFileSync(sarifPath, JSON.stringify(doc, null, 2));\ncore.info(`Wrote\
-          \ ${results.length} SARIF result(s) to ${sarifPath} (annotations from job\
-          \ ${jobName}).`);\n"
+      run: "python3 - <<'PYEOF'\n  import os, re, json\n  log_path = 'blog-open-redirect.shell_log'\n\
+        \  sarif_path = 'blog-open-redirect-results.sarif'\n  tool_name = 'blog-open-redirect'\n\
+        \  tool_version = '1.0.0'\n  information_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        \  rule_id_prefix = 'ai-devsecops-blog-open-redirect'\n  results = []\n  if\
+        \ os.path.exists(log_path):\n      pat = re.compile(r'^::(error|warning)(?:\
+        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n      for\
+        \ idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \          m = pat.match(line.rstrip('\\n'))\n          if not m:\n      \
+        \        continue\n          level, path, sl, el, msg = m.groups()\n     \
+        \     sl = int(sl) if sl else 1\n          el = int(el) if el else sl\n  \
+        \        if level == 'error':\n              sarif_level = 'error'\n     \
+        \     else:\n              sarif_level = 'warning'\n          msg = msg.strip()\n\
+        \          slug = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \          rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n          results.append({\n\
+        \              'ruleId': rule_id,\n              'level': sarif_level,\n \
+        \             'message': {'text': msg or '(no message)'},\n              'locations':\
+        \ [{\n                  'physicalLocation': {\n                      'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                      'region': {'startLine':\
+        \ sl, 'endLine': el},\n                  },\n              }],\n         \
+        \ })\n  existing = {}\n  if os.path.exists(sarif_path) and os.path.getsize(sarif_path)\
+        \ > 0:\n      try:\n          existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \      except Exception:\n          existing = {}\n  if not existing or 'runs'\
+        \ not in existing or not existing['runs']:\n      existing = {\n         \
+        \ 'version': '2.1.0',\n          '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \          'runs': [{\n              'tool': {'driver': {\n              \
+        \    'name': tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \              }},\n              'results': [],\n          }],\n      }\n\
+        \  existing['runs'][0]['tool']['driver']['name'] = tool_name\n  existing['runs'][0]['tool']['driver']['version']\
+        \ = tool_version\n  existing['runs'][0]['tool']['driver']['informationUri']\
+        \ = information_uri\n  existing['runs'][0]['results'] = (existing['runs'][0].get('results')\
+        \ or []) + results\n  with open(sarif_path, 'w', encoding='utf-8') as f:\n\
+        \      json.dump(existing, f, indent=2)\n  print(f'Wrote {len(results)} SARIF\
+        \ result(s) to {sarif_path}')\n  PYEOF\n"
     - name: Ensure blog-open-redirect-results.sarif exists (fallback for 0 findings)
       if: always()
       run: "if [ ! -s blog-open-redirect-results.sarif ]; then\n  echo \"::notice::blog-open-redirect\
