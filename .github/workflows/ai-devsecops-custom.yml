@@ -11,7 +11,7 @@ permissions:
   contents: read
   security-events: write
 jobs:
-  cms-markdown-xss-scan:
+  marked-xss-audit:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -20,256 +20,67 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: Detect unsanitised markdown render of user input
-      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
-
-        echo ''Rule body:''
-
-        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
-
-
-        SEMGREP_EOF
-
-        '
-    - name: Grep for unsafe markdown-to-view pipelines
+    - name: marked-without-sanitize-options
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: marked-without-sanitize\n\
+        \    patterns:\n      - pattern-either:\n          - pattern: marked($INPUT)\n\
+        \          - pattern: marked.parse($INPUT)\n      - pattern-not: marked($INPUT,\
+        \ {...})\n    message: \"marked() called without an options object - no sanitization\
+        \ configured. For blog/comment content use marked(input, {mangle:false}) and\
+        \ pipe output through DOMPurify to prevent stored XSS.\"\n    languages: [javascript]\n\
+        \    severity: ERROR\n    metadata:\n      category: security\n      cwe:\
+        \ \"CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site\
+        \ Scripting')\"\n      owasp: \"A03:2021 - Injection\"\nSEMGREP_EOF\n"
+    - name: scan-marked-and-sanitizer
       run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
-        \ -a sast.shell_log) 2>&1\n# Run the original script in a subshell with set\
-        \ +e so\n# that any single command failure does not abort the\n# script before\
-        \ it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"$GITHUB_WORKSPACE\"\
-        \n\n# 1. Find every place marked / showdown render something\nMARKED_HITS=$(grep\
-        \ -RInE 'marked(\\s*\\()?\\s*\\(|marked\\.parse\\s*\\(|new\\s+showdown\\.Converter'\
-        \ src/ 2>/dev/null || true)\n\n# 2. Confirm there is NO sanitiser in the same\
-        \ files\nUNSANITISED=$(echo \"$MARKED_HITS\" | while read -r line; do\n  file=\"\
-        $(echo \"$line\" | cut -d: -f1)\"\n  [ -z \"$file\" ] && continue\n  if !\
-        \ grep -qE 'DOMPurify|sanitize-html|xss|bleach' \"$file\"; then\n    echo\
-        \ \"$line\"\n  fi\ndone || true)\n\n# 3. Find EJS templates using unescaped\
-        \ output of likely-content vars\nEJS_BAD=$(grep -RInE '<%-\\s*[^%]*\\b(post|comment|content|body|markdown|renderedHtml)\\\
-        b' views/ 2>/dev/null || true)\n\nif [ -n \"$UNSANITISED\" ] || [ -n \"$EJS_BAD\"\
-        \ ]; then\n  echo \"::error title=Markdown XSS risk::\"\n  echo \"Unsaniitised\
-        \ markdown render calls:\"\n  echo \"$UNSANITISED\"\n  echo \"EJS unescaped\
-        \ content variables:\"\n  echo \"$EJS_BAD\"\n  exit 1\nfi\necho \"No unsafe\
-        \ markdown pipelines detected.\"\n) || inner_exit=$?\n# If the inner script\
-        \ exited non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
-        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
-        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' sast.shell_log;\
-        \ then\n  echo \"::error file=Grep for unsafe markdown-to-view pipelines::shell\
-        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
-        fi\nexit $inner_exit\n"
-    - name: Convert sast shell_check annotations to SARIF
-      if: always()
-      run: "cat > sast_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\nlog_path\
-        \ = 'sast.shell_log'\nsarif_path = 'sast-results.sarif'\ntool_name = 'sast'\n\
-        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
-        rule_id_prefix = 'ai-devsecops-sast'\nresults = []\nif os.path.exists(log_path):\n\
-        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
-        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
-        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
-        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
-        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
-        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
-        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
-        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
-        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
-        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
-        \       'message': {'text': msg or '(no message)'},\n            'locations':\
-        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
-        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
-        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
-        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
-        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
-        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
-        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
-        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
-        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
-        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
-        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
-        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
-        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
-        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
-        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 sast_annotations_to_sarif.py\n"
-    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
-      if: always()
-      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
-        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
-        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
-        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
-        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
-        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
-        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
-    - name: Upload sast SARIF to GitHub Code Scanning
-      if: always()
-      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
-      with:
-        sarif_file: sast-results.sarif
-        category: sast
-  multer-upload-validation-scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-      with:
-        persist-credentials: false
-    - name: Detect multer configured without fileFilter / limits
-      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
-
-        echo ''Rule body:''
-
-        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
-
-
-        SEMGREP_EOF
-
-        '
-    - name: Find multer configs missing fileFilter and limits
-      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
-        \ -a sast.shell_log) 2>&1\n# Run the original script in a subshell with set\
-        \ +e so\n# that any single command failure does not abort the\n# script before\
-        \ it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"$GITHUB_WORKSPACE\"\
-        \n\n# Locate every multer instantiation\nmapfile -t MULTER_FILES < <(grep\
-        \ -RIlE 'multer\\s*\\(\\s*\\{|multer\\.diskStorage|multer\\.memoryStorage'\
-        \ src/ 2>/dev/null || true)\n\nFAIL=0\nfor f in \"${MULTER_FILES[@]}\"; do\n\
-        \  [ -z \"$f\" ] && continue\n  echo \"::group::$f\"\n  if ! grep -qE 'fileFilter'\
-        \ \"$f\"; then\n    echo \"::error file=$f::multer() used without fileFilter\
-        \ \u2014 arbitrary file types accepted (CWE-434)\"\n    FAIL=1\n  fi\n  if\
-        \ ! grep -qE 'limits\\s*:\\s*\\{' \"$f\"; then\n    echo \"::error file=$f::multer()\
-        \ used without limits.fileSize \u2014 DoS via huge uploads (CWE-770)\"\n \
-        \   FAIL=1\n  fi\n  if grep -qE 'destination\\s*:\\s*function\\s*\\(\\s*req'\
-        \ \"$f\"; then\n    if grep -E 'destination\\s*:\\s*function\\s*\\(\\s*req'\
-        \ \"$f\" | grep -qE 'req\\.(body|query|params)'; then\n      echo \"::error\
-        \ file=$f::multer destination derived from req.body/params/query (CWE-22)\"\
-        \n      FAIL=1\n    fi\n  fi\n  echo \"::endgroup::\"\ndone\n\nif [ \"$FAIL\"\
-        \ -ne 0 ]; then\n  echo \"Multer upload-validation checks FAILED\"\n  exit\
-        \ 1\nfi\necho \"All multer configs include fileFilter and limits.\"\n) ||\
-        \ inner_exit=$?\n# If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
-        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
-        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
-        \ sast.shell_log; then\n  echo \"::error file=Find multer configs missing\
-        \ fileFilter and limits::shell check failed (exit code $inner_exit) \u2014\
-        \ see run log for details\"\nfi\nexit $inner_exit\n"
-    - name: Convert sast shell_check annotations to SARIF
-      if: always()
-      run: "cat > sast_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\nlog_path\
-        \ = 'sast.shell_log'\nsarif_path = 'sast-results.sarif'\ntool_name = 'sast'\n\
-        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
-        rule_id_prefix = 'ai-devsecops-sast'\nresults = []\nif os.path.exists(log_path):\n\
-        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
-        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
-        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
-        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
-        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
-        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
-        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
-        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
-        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
-        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
-        \       'message': {'text': msg or '(no message)'},\n            'locations':\
-        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
-        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
-        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
-        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
-        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
-        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
-        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
-        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
-        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
-        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
-        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
-        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
-        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
-        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
-        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
-        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 sast_annotations_to_sarif.py\n"
-    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
-      if: always()
-      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
-        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
-        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
-        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
-        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
-        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
-        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
-        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
-    - name: Upload sast SARIF to GitHub Code Scanning
-      if: always()
-      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
-      with:
-        sarif_file: sast-results.sarif
-        category: sast
-  jwt-auth-misconfig-scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
-      with:
-        persist-credentials: false
-    - name: Detect jwt.verify without algorithms and jwt.sign without expiresIn
-      run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
-
-        echo ''Rule body:''
-
-        cat <<''SEMGREP_EOF'' | sed ''s/^/  /''
-
-
-        SEMGREP_EOF
-
-        '
-    - name: Grep for unsafe jwt.verify and jwt.sign usage
-      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
-        \ -a sast.shell_log) 2>&1\n# Run the original script in a subshell with set\
-        \ +e so\n# that any single command failure does not abort the\n# script before\
-        \ it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"$GITHUB_WORKSPACE\"\
-        \n\nFAIL=0\n\n# 1. Every jwt.verify must have algorithms pinned\nmapfile -t\
-        \ VERIFY_LINES < <(grep -RInE 'jwt\\.verify\\s*\\(' src/ 2>/dev/null || true)\n\
-        for line in \"${VERIFY_LINES[@]}\"; do\n  [ -z \"$line\" ] && continue\n \
-        \ file=\"$(echo \"$line\" | cut -d: -f1)\"\n  lineno=\"$(echo \"$line\" |\
-        \ cut -d: -f2)\"\n  # Inspect the next 3 lines for an algorithms option\n\
-        \  if ! sed -n \"${lineno},$((lineno+3))p\" \"$file\" | grep -qE 'algorithms\\\
-        s*:\\s*\\[?\\s*[\"\\x27]'; then\n    echo \"::error file=$file line=$lineno::jwt.verify()\
-        \ called without algorithms option (CWE-347)\"\n    FAIL=1\n  fi\ndone\n\n\
-        # 2. Every jwt.sign should have an expiresIn (or be a short-lived token: warn\
-        \ only)\nmapfile -t SIGN_LINES < <(grep -RInE 'jwt\\.sign\\s*\\(' src/ 2>/dev/null\
-        \ || true)\nfor line in \"${SIGN_LINES[@]}\"; do\n  [ -z \"$line\" ] && continue\n\
-        \  file=\"$(echo \"$line\" | cut -d: -f1)\"\n  lineno=\"$(echo \"$line\" |\
-        \ cut -d: -f2)\"\n  if ! sed -n \"${lineno},$((lineno+3))p\" \"$file\" | grep\
-        \ -qE 'expiresIn\\s*:'; then\n    echo \"::warning file=$file line=$lineno::jwt.sign()\
-        \ does not set expiresIn (CWE-613)\"\n    FAIL=1\n  fi\ndone\n\n# 3. Hard-coded\
-        \ fallback secrets\nif grep -RInE 'JWT_SECRET\\s*\\|\\|\\s*[\"\\x27][^\"\\\
-        x27]{1,32}[\"\\x27]' src/ 2>/dev/null; then\n  echo \"::error::Hard-coded\
-        \ fallback JWT_SECRET detected (CWE-798)\"\n  FAIL=1\nfi\n\nif [ \"$FAIL\"\
-        \ -ne 0 ]; then\n  echo \"JWT auth misconfiguration checks FAILED\"\n  exit\
-        \ 1\nfi\necho \"JWT usage looks properly configured.\"\n) || inner_exit=$?\n\
+        \ -a cms-xss.shell_log) 2>&1\n# Run the original script in a subshell with\
+        \ set +e so\n# that any single command failure does not abort the\n# script\
+        \ before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"\
+        $GITHUB_WORKSPACE\"\n# 1) Find every marked() call in src/\ngrep -rnE \"marked\\\
+        s*\\(|marked\\.parse\\s*\\(\" src/ --include=\"*.js\" > /tmp/marked-uses.txt\
+        \ || true\n# 2) Verify a sanitizer is imported in package.json (DOMPurify/sanitize-html)\n\
+        grep -qE \"(dompurify|sanitize-html|xss)\" package.json || { echo \"::error::No\
+        \ HTML sanitizer (dompurify/sanitize-html) declared in package.json - marked()\
+        \ output will contain raw HTML, exposing /posts and /comments to stored XSS\"\
+        ; exit 1; }\n# 3) Verify the sanitizer is actually applied in the same file(s)\
+        \ that call marked()\nwhile IFS=: read -r file _; do\n  if ! grep -qE \"DOMPurify\\\
+        .sanitize|sanitizeHtml|\\.sanitize\\(\" \"$file\"; then\n    echo \"::error\
+        \ file=${file}::marked() used in ${file} but no .sanitize(...) call in the\
+        \ same file - stored XSS risk\"\n    exit 1\n  fi\ndone < /tmp/marked-uses.txt\n\
+        echo \"OK: marked() output is sanitized in every consumer file\"\n) || inner_exit=$?\n\
         # If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
         \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
         \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
-        \ sast.shell_log; then\n  echo \"::error file=Grep for unsafe jwt.verify and\
-        \ jwt.sign usage::shell check failed (exit code $inner_exit) \u2014 see run\
-        \ log for details\"\nfi\nexit $inner_exit\n"
-    - name: Convert sast shell_check annotations to SARIF
+        \ cms-xss.shell_log; then\n  echo \"::error file=scan-marked-and-sanitizer::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: Convert cms-xss shell_check annotations to SARIF
       if: always()
-      run: "cat > sast_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\nlog_path\
-        \ = 'sast.shell_log'\nsarif_path = 'sast-results.sarif'\ntool_name = 'sast'\n\
-        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
-        rule_id_prefix = 'ai-devsecops-sast'\nresults = []\nif os.path.exists(log_path):\n\
-        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
-        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
-        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
-        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
-        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
-        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
-        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
-        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+      run: "cat > cms-xss_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\n\
+        log_path = 'cms-xss.shell_log'\nsarif_path = 'cms-xss-results.sarif'\ntool_name\
+        \ = 'cms-xss'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-cms-xss'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
         \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
         \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
         \       'message': {'text': msg or '(no message)'},\n            'locations':\
@@ -289,25 +100,265 @@ jobs:
         existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
         \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
         \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 sast_annotations_to_sarif.py\n"
-    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
+        PY_EOF\npython3 cms-xss_annotations_to_sarif.py\n"
+    - name: Ensure cms-xss-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
-        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
-        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s cms-xss-results.sarif ]; then\n  echo \"::notice::cms-xss found\
+        \ 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
+        : {' \\\n    '          \"name\": \"cms-xss\",' \\\n    '          \"version\"\
         : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
         ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
-        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
-    - name: Upload sast SARIF to GitHub Code Scanning
+        \n    '    }' \\\n    '  ]' \\\n    '}' > cms-xss-results.sarif\nfi\necho\
+        \ \"\u2713 cms-xss-results.sarif size: $(stat -c%s cms-xss-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload cms-xss SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: sast-results.sarif
-        category: sast
+        sarif_file: cms-xss-results.sarif
+        category: cms-xss
+  multer-upload-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: multer-missing-filefilter
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: multer-missing-filefilter\n\
+        \    patterns:\n      - pattern: multer({...})\n      - pattern-not: multer({...,\
+        \ fileFilter: $F, ...})\n    message: \"multer() instantiated without a `fileFilter`\
+        \ callback - any file type (executables, scripts, .htaccess) can be uploaded\
+        \ via /upload.\"\n    languages: [javascript]\n    severity: ERROR\n    metadata:\n\
+        \      category: security\n      cwe: \"CWE-434: Unrestricted Upload of File\
+        \ with Dangerous Type\"\n  - id: multer-diskstorage-originalname\n    pattern:\
+        \ diskStorage({destination: $D, filename: $FN($REQ, $FILE, $CB)})\n    message:\
+        \ \"diskStorage uses a custom filename callback. Verify the callback does\
+        \ NOT use file.originalname directly (path traversal). Replace with a random/uuid-based\
+        \ name.\"\n    languages: [javascript]\n    severity: WARNING\n    metadata:\n\
+        \      category: security\n      cwe: \"CWE-22: Improper Limitation of a Pathname\
+        \ to a Restricted Directory ('Path Traversal')\"\nSEMGREP_EOF\n"
+    - name: audit-multer-config
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a file-upload.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        cd \"$GITHUB_WORKSPACE\"\nUPLOAD_FILE=\"$(grep -rlE \"multer\\s*\\(\" src/\
+        \ --include=\"*.js\" | head -n1 || true)\"\n[ -n \"$UPLOAD_FILE\" ] || { echo\
+        \ \"No multer usage found in src/\"; exit 0; }\necho \"Inspecting $UPLOAD_FILE\"\
+        \n# Extract the multer({...}) block (single or multi-line)\npython3 - \"$UPLOAD_FILE\"\
+        \ <<'PY' > /tmp/multer-block.txt\nimport re,sys\nsrc=open(sys.argv[1]).read()\n\
+        m=re.search(r'multer\\s*\\(\\s*\\{[^}]*\\}\\s*\\)', src, re.S)\nprint(m.group(0)\
+        \ if m else \"\")\nPY\n# Require fileFilter\nif ! grep -qE \"fileFilter\"\
+        \ /tmp/multer-block.txt; then\n  echo \"::error file=${UPLOAD_FILE}::multer()\
+        \ is missing a fileFilter - arbitrary file upload is possible on /upload\"\
+        \n  exit 1\nfi\n# Require a size limit\nif ! grep -qE \"limits|fileSize\"\
+        \ /tmp/multer-block.txt; then\n  echo \"::error file=${UPLOAD_FILE}::multer()\
+        \ is missing limits.fileSize - DoS via oversized uploads is possible\"\n \
+        \ exit 1\nfi\n# Forbid raw use of originalname in a diskStorage filename callback\
+        \ (path traversal)\nif grep -nE \"filename\\s*:\\s*.*file\\.originalname\"\
+        \ \"$UPLOAD_FILE\" | grep -vE \"path\\.basename|path\\.extname|sanitize\"\
+        \ > /dev/null; then\n  echo \"::error file=${UPLOAD_FILE}::diskStorage filename\
+        \ callback uses file.originalname without sanitization - path traversal risk\"\
+        \n  exit 1\nfi\necho \"OK: multer config includes fileFilter, size limits,\
+        \ and safe filename handling\"\n) || inner_exit=$?\n# If the inner script\
+        \ exited non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' file-upload.shell_log;\
+        \ then\n  echo \"::error file=audit-multer-config::shell check failed (exit\
+        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert file-upload shell_check annotations to SARIF
+      if: always()
+      run: "cat > file-upload_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\n\
+        log_path = 'file-upload.shell_log'\nsarif_path = 'file-upload-results.sarif'\n\
+        tool_name = 'file-upload'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-file-upload'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 file-upload_annotations_to_sarif.py\n"
+    - name: Ensure file-upload-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s file-upload-results.sarif ]; then\n  echo \"::notice::file-upload\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"file-upload\",' \\\n    '          \"\
+        version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > file-upload-results.sarif\nfi\n\
+        echo \"\u2713 file-upload-results.sarif size: $(stat -c%s file-upload-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload file-upload SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: file-upload-results.sarif
+        category: file-upload
+  jwt-config-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+      with:
+        persist-credentials: false
+    - name: jwt-verify-missing-algorithms
+      run: "echo 'AI-designed Semgrep rule (id=ai-rule):'\necho 'Rule body:'\ncat\
+        \ <<'SEMGREP_EOF' | sed 's/^/  /'\nrules:\n  - id: jwt-verify-missing-algorithms\n\
+        \    patterns:\n      - pattern-either:\n          - pattern: jwt.verify($TOKEN,\
+        \ $SECRET)\n          - pattern: jwt.verify($TOKEN, $SECRET, $CB)\n      -\
+        \ pattern-not: jwt.verify($TOKEN, $SECRET, {algorithms: [...], ...})\n   \
+        \   - pattern-not: jwt.verify($TOKEN, $SECRET, {algorithms: [...], ...}, $CB)\n\
+        \    message: \"jwt.verify() called without an `algorithms` whitelist. Pass\
+        \ `{algorithms:['HS256']}` (or the alg you intend) to prevent alg=none / RS256->HS256\
+        \ confusion attacks.\"\n    languages: [javascript]\n    severity: ERROR\n\
+        \    metadata:\n      category: security\n      cwe: \"CWE-347: Improper Verification\
+        \ of Cryptographic Signature\"\n  - id: jwt-sign-no-algorithm\n    patterns:\n\
+        \      - pattern-either:\n          - pattern: jwt.sign($P, $S)\n        \
+        \  - pattern: jwt.sign($P, $S, $CB)\n      - pattern-not: jwt.sign($P, $S,\
+        \ {algorithm: ..., ...})\n      - pattern-not: jwt.sign($P, $S, {algorithm:\
+        \ ..., ...}, $CB)\n    message: \"jwt.sign() called without an explicit `algorithm`.\
+        \ Specify algorithm explicitly to make the key type unambiguous.\"\n    languages:\
+        \ [javascript]\n    severity: WARNING\n    metadata:\n      category: security\n\
+        \      cwe: \"CWE-327: Use of a Broken or Risky Cryptographic Algorithm\"\n\
+        SEMGREP_EOF\n"
+    - name: scan-jwt-sign-verify
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a auth-jwt.shell_log) 2>&1\n# Run the original script in a subshell with\
+        \ set +e so\n# that any single command failure does not abort the\n# script\
+        \ before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"\
+        $GITHUB_WORKSPACE\"\n# 1) Hardcoded JWT secret in source (string-literal second\
+        \ arg to jwt.sign)\nif grep -rnE \"jwt\\.sign\\s*\\(\\s*[^,]+,\\s*['\\\"][^'\\\
+        \"]+['\\\"]\" src/ --include=\"*.js\"; then\n  echo \"::error::Hardcoded JWT\
+        \ secret string literal detected in src/ - move to process.env.JWT_SECRET\"\
+        \n  exit 1\nfi\n# 2) jwt.verify() without algorithms whitelist in the same\
+        \ options object\npython3 - <<'PY'\nimport re,glob,sys,os\nbad=[]\nfor f in\
+        \ glob.glob('src/**/*.js', recursive=True):\n    s=open(f).read()\n    # crude\
+        \ balanced-brace scan around each jwt.verify\n    for m in re.finditer(r'jwt\\\
+        .verify\\s*\\(', s):\n        i=s.find('{', m.end()); j=s.find(')', m.end())\n\
+        \        if i==-1 or j==-1 or i>j: continue\n        opts=s[i:j+1]\n     \
+        \   if 'algorithms' not in opts:\n            line=s[:m.start()].count('\\\
+        n')+1\n            bad.append(f\"{f}:{line}\")\nif bad:\n    print('::error::jwt.verify()\
+        \ missing algorithms whitelist at:')\n    for b in bad: print(' -',b)\n  \
+        \  sys.exit(1)\nprint('OK: every jwt.verify() call declares an algorithms\
+        \ whitelist')\nPY\n) || inner_exit=$?\n# If the inner script exited non-zero\
+        \ and emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' auth-jwt.shell_log; then\n  echo\
+        \ \"::error file=scan-jwt-sign-verify::shell check failed (exit code $inner_exit)\
+        \ \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert auth-jwt shell_check annotations to SARIF
+      if: always()
+      run: "cat > auth-jwt_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\n\
+        log_path = 'auth-jwt.shell_log'\nsarif_path = 'auth-jwt-results.sarif'\ntool_name\
+        \ = 'auth-jwt'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-auth-jwt'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {\n                'name':\
+        \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
+        \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
+        \ = tool_name\nexisting['runs'][0]['tool']['driver']['version'] = tool_version\n\
+        existing['runs'][0]['tool']['driver']['informationUri'] = information_uri\n\
+        existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
+        \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
+        \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
+        PY_EOF\npython3 auth-jwt_annotations_to_sarif.py\n"
+    - name: Ensure auth-jwt-results.sarif exists (fallback for 0 findings)
+      if: always()
+      run: "if [ ! -s auth-jwt-results.sarif ]; then\n  echo \"::notice::auth-jwt\
+        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
+        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+        : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
+        : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
+        : {' \\\n    '          \"name\": \"auth-jwt\",' \\\n    '          \"version\"\
+        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > auth-jwt-results.sarif\nfi\necho\
+        \ \"\u2713 auth-jwt-results.sarif size: $(stat -c%s auth-jwt-results.sarif)\
+        \ bytes\"\n"
+    - name: Upload auth-jwt SARIF to GitHub Code Scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
+      with:
+        sarif_file: auth-jwt-results.sarif
+        category: auth-jwt
   blog-markdown-sanitize:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -341,25 +392,39 @@ jobs:
         \ re, json\nlog_path = 'blog-markdown-xss.shell_log'\nsarif_path = 'blog-markdown-xss-results.sarif'\n\
         tool_name = 'blog-markdown-xss'\ntool_version = '1.0.0'\ninformation_uri =\
         \ 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-blog-markdown-xss'\n\
-        results = []\nif os.path.exists(log_path):\n    pat = re.compile(r'^::(error|warning)(?:\
-        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n    for idx,\
-        \ line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        results = []\nif os.path.exists(log_path):\n    pat = re.compile(\n      \
+        \  r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
         \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
-        \  continue\n        level, path, sl, el, msg = m.groups()\n        sl = int(sl)\
-        \ if sl else 1\n        el = int(el) if el else sl\n        if level == 'error':\n\
-        \            sarif_level = 'error'\n        else:\n            sarif_level\
-        \ = 'warning'\n        msg = msg.strip()\n        slug = re.sub(r'[^a-z0-9]+',\
-        \ '-', (msg or 'finding').lower())[:50].strip('-')\n        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
-        \        results.append({\n            'ruleId': rule_id,\n            'level':\
-        \ sarif_level,\n            'message': {'text': msg or '(no message)'},\n\
-        \            'locations': [{\n                'physicalLocation': {\n    \
-        \                'artifactLocation': {'uri': path or 'unknown'},\n       \
-        \             'region': {'startLine': sl, 'endLine': el},\n              \
-        \  },\n            }],\n        })\nexisting = {}\nif os.path.exists(sarif_path)\
-        \ and os.path.getsize(sarif_path) > 0:\n    try:\n        existing = json.load(open(sarif_path,\
-        \ encoding='utf-8'))\n    except Exception:\n        existing = {}\nif not\
-        \ existing or 'runs' not in existing or not existing['runs']:\n    existing\
-        \ = {\n        'version': '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
         \        'runs': [{\n            'tool': {'driver': {\n                'name':\
         \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
         \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
@@ -417,14 +482,27 @@ jobs:
         log_path = 'blog-csrf.shell_log'\nsarif_path = 'blog-csrf-results.sarif'\n\
         tool_name = 'blog-csrf'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
         rule_id_prefix = 'ai-devsecops-blog-csrf'\nresults = []\nif os.path.exists(log_path):\n\
-        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
-        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
-        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
-        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
-        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
-        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
-        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
-        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
         \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
         \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
         \       'message': {'text': msg or '(no message)'},\n            'locations':\
@@ -493,14 +571,27 @@ jobs:
         log_path = 'blog-csp.shell_log'\nsarif_path = 'blog-csp-results.sarif'\ntool_name\
         \ = 'blog-csp'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
         rule_id_prefix = 'ai-devsecops-blog-csp'\nresults = []\nif os.path.exists(log_path):\n\
-        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
-        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
-        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
-        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
-        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
-        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
-        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
-        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
         \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
         \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
         \       'message': {'text': msg or '(no message)'},\n            'locations':\
@@ -574,14 +665,27 @@ jobs:
         \ 'blog-multer-hardening-results.sarif'\ntool_name = 'blog-multer-hardening'\n\
         tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
         rule_id_prefix = 'ai-devsecops-blog-multer-hardening'\nresults = []\nif os.path.exists(log_path):\n\
-        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
-        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
-        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
-        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
-        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
-        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
-        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
-        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \    pat = re.compile(\n        r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
         \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
         \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
         \       'message': {'text': msg or '(no message)'},\n            'locations':\
@@ -654,25 +758,39 @@ jobs:
         \ re, json\nlog_path = 'blog-jwt-hardening.shell_log'\nsarif_path = 'blog-jwt-hardening-results.sarif'\n\
         tool_name = 'blog-jwt-hardening'\ntool_version = '1.0.0'\ninformation_uri\
         \ = 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-blog-jwt-hardening'\n\
-        results = []\nif os.path.exists(log_path):\n    pat = re.compile(r'^::(error|warning)(?:\
-        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n    for idx,\
-        \ line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        results = []\nif os.path.exists(log_path):\n    pat = re.compile(\n      \
+        \  r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
         \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
-        \  continue\n        level, path, sl, el, msg = m.groups()\n        sl = int(sl)\
-        \ if sl else 1\n        el = int(el) if el else sl\n        if level == 'error':\n\
-        \            sarif_level = 'error'\n        else:\n            sarif_level\
-        \ = 'warning'\n        msg = msg.strip()\n        slug = re.sub(r'[^a-z0-9]+',\
-        \ '-', (msg or 'finding').lower())[:50].strip('-')\n        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
-        \        results.append({\n            'ruleId': rule_id,\n            'level':\
-        \ sarif_level,\n            'message': {'text': msg or '(no message)'},\n\
-        \            'locations': [{\n                'physicalLocation': {\n    \
-        \                'artifactLocation': {'uri': path or 'unknown'},\n       \
-        \             'region': {'startLine': sl, 'endLine': el},\n              \
-        \  },\n            }],\n        })\nexisting = {}\nif os.path.exists(sarif_path)\
-        \ and os.path.getsize(sarif_path) > 0:\n    try:\n        existing = json.load(open(sarif_path,\
-        \ encoding='utf-8'))\n    except Exception:\n        existing = {}\nif not\
-        \ existing or 'runs' not in existing or not existing['runs']:\n    existing\
-        \ = {\n        'version': '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
         \        'runs': [{\n            'tool': {'driver': {\n                'name':\
         \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
         \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
@@ -731,25 +849,39 @@ jobs:
         \ re, json\nlog_path = 'blog-open-redirect.shell_log'\nsarif_path = 'blog-open-redirect-results.sarif'\n\
         tool_name = 'blog-open-redirect'\ntool_version = '1.0.0'\ninformation_uri\
         \ = 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-blog-open-redirect'\n\
-        results = []\nif os.path.exists(log_path):\n    pat = re.compile(r'^::(error|warning)(?:\
-        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n    for idx,\
-        \ line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
+        results = []\nif os.path.exists(log_path):\n    pat = re.compile(\n      \
+        \  r'^::(error|warning)(?:\\s+([A-Za-z]+=[^,]+(?:,[A-Za-z]+=[^,]+)*))?::(.*)$'\n\
+        \    )\n    for idx, line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
         \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
-        \  continue\n        level, path, sl, el, msg = m.groups()\n        sl = int(sl)\
-        \ if sl else 1\n        el = int(el) if el else sl\n        if level == 'error':\n\
-        \            sarif_level = 'error'\n        else:\n            sarif_level\
-        \ = 'warning'\n        msg = msg.strip()\n        slug = re.sub(r'[^a-z0-9]+',\
-        \ '-', (msg or 'finding').lower())[:50].strip('-')\n        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
-        \        results.append({\n            'ruleId': rule_id,\n            'level':\
-        \ sarif_level,\n            'message': {'text': msg or '(no message)'},\n\
-        \            'locations': [{\n                'physicalLocation': {\n    \
-        \                'artifactLocation': {'uri': path or 'unknown'},\n       \
-        \             'region': {'startLine': sl, 'endLine': el},\n              \
-        \  },\n            }],\n        })\nexisting = {}\nif os.path.exists(sarif_path)\
-        \ and os.path.getsize(sarif_path) > 0:\n    try:\n        existing = json.load(open(sarif_path,\
-        \ encoding='utf-8'))\n    except Exception:\n        existing = {}\nif not\
-        \ existing or 'runs' not in existing or not existing['runs']:\n    existing\
-        \ = {\n        'version': '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \  continue\n        level, props, msg = m.groups()\n        path = None\n\
+        \        sl = None\n        el = None\n        title = None\n        if props:\n\
+        \            for kv in props.split(','):\n                if '=' in kv:\n\
+        \                    k, v = kv.split('=', 1)\n                    k = k.strip()\n\
+        \                    v = v.strip()\n                    if k == 'file':\n\
+        \                        path = v\n                    elif k == 'line':\n\
+        \                        try:\n                            sl = int(v)\n \
+        \                       except ValueError:\n                            pass\n\
+        \                    elif k in ('endLine', 'col'):\n                     \
+        \   try:\n                            el = int(v) if k == 'endLine' else sl\n\
+        \                        except ValueError:\n                            pass\n\
+        \                    elif k == 'title':\n                        title = v\n\
+        \        if sl is None:\n            sl = 1\n        if el is None:\n    \
+        \        el = sl\n        sarif_level = 'error' if level == 'error' else 'warning'\n\
+        \        msg = (msg or '').strip()\n        # If there is no file but there\
+        \ is a title, use the\n        if not msg and title:\n            msg = title\n\
+        \        # Use the first 50 chars of the title (if any) as\n        slug_src\
+        \ = title or msg or 'finding'\n        slug = re.sub(r'[^a-z0-9]+', '-', slug_src.lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
         \        'runs': [{\n            'tool': {'driver': {\n                'name':\
         \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
         \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
