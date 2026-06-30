@@ -11,7 +11,7 @@ permissions:
   contents: read
   security-events: write
 jobs:
-  markdown-xss-scan:
+  cms-markdown-xss-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -20,25 +20,7 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: detect-unsanitized-markdown-render
-      run: "set -euo pipefail\nexec > >(tee -a markdown-xss.shell_log) 2>&1\n# Find\
-        \ every place Markdown is rendered to HTML\nPATTERNS=$(grep -RInE --include='*.js'\
-        \ \\\n  '(marked\\s*\\(|marked\\.parse\\s*\\(|showdown\\.Converter|\\.makeHtml\\\
-        s*\\()' \\\n  src/ 2>/dev/null || true)\n\nif [ -z \"$PATTERNS\" ]; then\n\
-        \  echo \"No markdown render calls found \u2014 nothing to scan.\"\n  exit\
-        \ 0\nfi\necho \"$PATTERNS\"\n\n# Check that a sanitization layer is configured\
-        \ somewhere in the project\nHAS_SANITIZER=$(grep -RIE --include='*.js' --include='*.json'\
-        \ \\\n  '(DOMPurify|sanitize-html|sanitizeHtml|xss\\b)' \\\n  src/ package.json\
-        \ 2>/dev/null | wc -l)\n\n# Check for marked's built-in sanitize option or\
-        \ showdown strikethrough/sanitize config\nHAS_MARKED_SANITIZE=$(grep -RInE\
-        \ --include='*.js' \\\n  '(sanitize\\s*:\\s*true|sanitize:\\s*\\{\\s*\\})'\
-        \ \\\n  src/ 2>/dev/null | wc -l)\n\nif [ \"$HAS_SANITIZER\" -eq 0 ] && [\
-        \ \"$HAS_MARKED_SANITIZE\" -eq 0 ]; then\n  echo \"::error::Markdown is rendered\
-        \ in src/routes/posts.js or src/routes/comments.js but NO sanitization layer\
-        \ (DOMPurify/sanitize-html/xss or marked sanitize:true) is present. Stored\
-        \ XSS risk.\"\n  exit 1\nfi\necho \"Sanitization layer detected \u2014 OK.\"\
-        \n"
-    - name: semgrep-markdown-xss
+    - name: Detect unsanitised markdown render of user input
       run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
 
         echo ''Rule body:''
@@ -49,12 +31,36 @@ jobs:
         SEMGREP_EOF
 
         '
-    - name: Convert markdown-xss shell_check annotations to SARIF
+    - name: Grep for unsafe markdown-to-view pipelines
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a sast.shell_log) 2>&1\n# Run the original script in a subshell with set\
+        \ +e so\n# that any single command failure does not abort the\n# script before\
+        \ it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"$GITHUB_WORKSPACE\"\
+        \n\n# 1. Find every place marked / showdown render something\nMARKED_HITS=$(grep\
+        \ -RInE 'marked(\\s*\\()?\\s*\\(|marked\\.parse\\s*\\(|new\\s+showdown\\.Converter'\
+        \ src/ 2>/dev/null || true)\n\n# 2. Confirm there is NO sanitiser in the same\
+        \ files\nUNSANITISED=$(echo \"$MARKED_HITS\" | while read -r line; do\n  file=\"\
+        $(echo \"$line\" | cut -d: -f1)\"\n  [ -z \"$file\" ] && continue\n  if !\
+        \ grep -qE 'DOMPurify|sanitize-html|xss|bleach' \"$file\"; then\n    echo\
+        \ \"$line\"\n  fi\ndone || true)\n\n# 3. Find EJS templates using unescaped\
+        \ output of likely-content vars\nEJS_BAD=$(grep -RInE '<%-\\s*[^%]*\\b(post|comment|content|body|markdown|renderedHtml)\\\
+        b' views/ 2>/dev/null || true)\n\nif [ -n \"$UNSANITISED\" ] || [ -n \"$EJS_BAD\"\
+        \ ]; then\n  echo \"::error title=Markdown XSS risk::\"\n  echo \"Unsaniitised\
+        \ markdown render calls:\"\n  echo \"$UNSANITISED\"\n  echo \"EJS unescaped\
+        \ content variables:\"\n  echo \"$EJS_BAD\"\n  exit 1\nfi\necho \"No unsafe\
+        \ markdown pipelines detected.\"\n) || inner_exit=$?\n# If the inner script\
+        \ exited non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' sast.shell_log;\
+        \ then\n  echo \"::error file=Grep for unsafe markdown-to-view pipelines::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
+    - name: Convert sast shell_check annotations to SARIF
       if: always()
-      run: "cat > markdown-xss_annotations_to_sarif.py <<'PY_EOF'\nimport os, re,\
-        \ json\nlog_path = 'markdown-xss.shell_log'\nsarif_path = 'markdown-xss-results.sarif'\n\
-        tool_name = 'markdown-xss'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
-        rule_id_prefix = 'ai-devsecops-markdown-xss'\nresults = []\nif os.path.exists(log_path):\n\
+      run: "cat > sast_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\nlog_path\
+        \ = 'sast.shell_log'\nsarif_path = 'sast-results.sarif'\ntool_name = 'sast'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-sast'\nresults = []\nif os.path.exists(log_path):\n\
         \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
         d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
         \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
@@ -82,27 +88,26 @@ jobs:
         existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
         \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
         \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 markdown-xss_annotations_to_sarif.py\n"
-    - name: Ensure markdown-xss-results.sarif exists (fallback for 0 findings)
+        PY_EOF\npython3 sast_annotations_to_sarif.py\n"
+    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s markdown-xss-results.sarif ]; then\n  echo \"::notice::markdown-xss\
-        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
-        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
+        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
+        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"markdown-xss\",' \\\n    '          \"\
-        version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
+        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
         ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > markdown-xss-results.sarif\nfi\n\
-        echo \"\u2713 markdown-xss-results.sarif size: $(stat -c%s markdown-xss-results.sarif)\
-        \ bytes\"\n"
-    - name: Upload markdown-xss SARIF to GitHub Code Scanning
+        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
+        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
+    - name: Upload sast SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: markdown-xss-results.sarif
-        category: markdown-xss
-  jwt-auth-hardening:
+        sarif_file: sast-results.sarif
+        category: sast
+  multer-upload-validation-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -111,24 +116,7 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: detect-jwt-misconfig-and-hardcoded-secret
-      run: "set -euo pipefail\nexec > >(tee -a jwt-hardening.shell_log) 2>&1\nFAIL=0\n\
-        \n# 1. Hardcoded JWT secret fallback (e.g. jwt.sign(payload, 'super-secret'))\n\
-        if grep -RInE --include='*.js' \\\n  \"jwt\\.(sign|verify)\\s*\\([^)]*['\\\
-        \"][A-Za-z0-9_\\-]{8,}['\\\"]\" \\\n  src/ 2>/dev/null; then\n  echo \"::error::Hardcoded\
-        \ JWT secret string literal detected. Use process.env.JWT_SECRET only.\"\n\
-        \  FAIL=1\nfi\n\n# 2. jwt.verify call WITHOUT an algorithms allowlist (alg-confusion\
-        \ risk)\nUNGUARDED=$(grep -RInE --include='*.js' \\\n  'jwt\\.verify\\s*\\\
-        ([^,]+,\\s*[^,)]+\\s*\\)' \\\n  src/ 2>/dev/null | grep -v 'algorithms' ||\
-        \ true)\nif [ -n \"$UNGUARDED\" ]; then\n  echo \"::error::jwt.verify() called\
-        \ without explicit { algorithms: [...] } allowlist:\"\n  echo \"$UNGUARDED\"\
-        \n  FAIL=1\nfi\n\n# 3. jwt.sign without expiresIn \u2192 tokens never expire\n\
-        NO_EXP=$(grep -RInE --include='*.js' \\\n  'jwt\\.sign\\s*\\(' \\\n  src/\
-        \ 2>/dev/null | grep -v 'expiresIn' || true)\nif [ -n \"$NO_EXP\" ]; then\n\
-        \  echo \"::warning::jwt.sign() called without expiresIn option (tokens will\
-        \ never expire):\"\n  echo \"$NO_EXP\"\nfi\n\n[ \"$FAIL\" -eq 0 ] && echo\
-        \ \"JWT auth configuration looks hardened.\" || exit 1\n"
-    - name: semgrep-jwt-alg-confusion
+    - name: Detect multer configured without fileFilter / limits
       run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
 
         echo ''Rule body:''
@@ -139,12 +127,38 @@ jobs:
         SEMGREP_EOF
 
         '
-    - name: Convert jwt-hardening shell_check annotations to SARIF
+    - name: Find multer configs missing fileFilter and limits
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a sast.shell_log) 2>&1\n# Run the original script in a subshell with set\
+        \ +e so\n# that any single command failure does not abort the\n# script before\
+        \ it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"$GITHUB_WORKSPACE\"\
+        \n\n# Locate every multer instantiation\nmapfile -t MULTER_FILES < <(grep\
+        \ -RIlE 'multer\\s*\\(\\s*\\{|multer\\.diskStorage|multer\\.memoryStorage'\
+        \ src/ 2>/dev/null || true)\n\nFAIL=0\nfor f in \"${MULTER_FILES[@]}\"; do\n\
+        \  [ -z \"$f\" ] && continue\n  echo \"::group::$f\"\n  if ! grep -qE 'fileFilter'\
+        \ \"$f\"; then\n    echo \"::error file=$f::multer() used without fileFilter\
+        \ \u2014 arbitrary file types accepted (CWE-434)\"\n    FAIL=1\n  fi\n  if\
+        \ ! grep -qE 'limits\\s*:\\s*\\{' \"$f\"; then\n    echo \"::error file=$f::multer()\
+        \ used without limits.fileSize \u2014 DoS via huge uploads (CWE-770)\"\n \
+        \   FAIL=1\n  fi\n  if grep -qE 'destination\\s*:\\s*function\\s*\\(\\s*req'\
+        \ \"$f\"; then\n    if grep -E 'destination\\s*:\\s*function\\s*\\(\\s*req'\
+        \ \"$f\" | grep -qE 'req\\.(body|query|params)'; then\n      echo \"::error\
+        \ file=$f::multer destination derived from req.body/params/query (CWE-22)\"\
+        \n      FAIL=1\n    fi\n  fi\n  echo \"::endgroup::\"\ndone\n\nif [ \"$FAIL\"\
+        \ -ne 0 ]; then\n  echo \"Multer upload-validation checks FAILED\"\n  exit\
+        \ 1\nfi\necho \"All multer configs include fileFilter and limits.\"\n) ||\
+        \ inner_exit=$?\n# If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
+        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
+        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
+        \ sast.shell_log; then\n  echo \"::error file=Find multer configs missing\
+        \ fileFilter and limits::shell check failed (exit code $inner_exit) \u2014\
+        \ see run log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert sast shell_check annotations to SARIF
       if: always()
-      run: "cat > jwt-hardening_annotations_to_sarif.py <<'PY_EOF'\nimport os, re,\
-        \ json\nlog_path = 'jwt-hardening.shell_log'\nsarif_path = 'jwt-hardening-results.sarif'\n\
-        tool_name = 'jwt-hardening'\ntool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
-        rule_id_prefix = 'ai-devsecops-jwt-hardening'\nresults = []\nif os.path.exists(log_path):\n\
+      run: "cat > sast_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\nlog_path\
+        \ = 'sast.shell_log'\nsarif_path = 'sast-results.sarif'\ntool_name = 'sast'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-sast'\nresults = []\nif os.path.exists(log_path):\n\
         \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
         d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
         \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
@@ -172,27 +186,26 @@ jobs:
         existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
         \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
         \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 jwt-hardening_annotations_to_sarif.py\n"
-    - name: Ensure jwt-hardening-results.sarif exists (fallback for 0 findings)
+        PY_EOF\npython3 sast_annotations_to_sarif.py\n"
+    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s jwt-hardening-results.sarif ]; then\n  echo \"::notice::jwt-hardening\
-        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
-        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
+        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
+        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"jwt-hardening\",' \\\n    '          \"\
-        version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
+        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
         ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
-        \n    '    }' \\\n    '  ]' \\\n    '}' > jwt-hardening-results.sarif\nfi\n\
-        echo \"\u2713 jwt-hardening-results.sarif size: $(stat -c%s jwt-hardening-results.sarif)\
-        \ bytes\"\n"
-    - name: Upload jwt-hardening SARIF to GitHub Code Scanning
+        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
+        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
+    - name: Upload sast SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: jwt-hardening-results.sarif
-        category: jwt-hardening
-  multer-upload-audit:
+        sarif_file: sast-results.sarif
+        category: sast
+  jwt-auth-misconfig-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
@@ -201,32 +214,7 @@ jobs:
       uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
       with:
         persist-credentials: false
-    - name: detect-multer-misconfig
-      run: "set -euo pipefail\nexec > >(tee -a multer-upload-audit.shell_log) 2>&1\n\
-        FAIL=0\n\n# 1. Multer instantiated without a fileFilter (accepts any type)\n\
-        NO_FILTER=$(grep -RInE --include='*.js' \\\n  'multer\\s*\\(\\s*\\{\\s*(dest|storage)\\\
-        s*:' \\\n  src/ 2>/dev/null | grep -v 'fileFilter' || true)\nif [ -n \"$NO_FILTER\"\
-        \ ]; then\n  echo \"::error::multer() configured with dest/storage but NO\
-        \ fileFilter. Any file type (incl. .html) will be accepted:\"\n  echo \"$NO_FILTER\"\
-        \n  FAIL=1\nfi\n\n# 2. Multer instantiated without a size limit (DoS via huge\
-        \ upload)\nNO_LIMIT=$(grep -RInE --include='*.js' \\\n  'multer\\s*\\(\\s*\\\
-        {\\s*(dest|storage)\\s*:' \\\n  src/ 2>/dev/null | grep -v 'limits' || true)\n\
-        if [ -n \"$NO_LIMIT\" ]; then\n  echo \"::error::multer() configured without\
-        \ limits.fileSize. Unbounded upload size (DoS):\"\n  echo \"$NO_LIMIT\"\n\
-        \  FAIL=1\nfi\n\n# 3. express.static mount on the upload directory with default\
-        \ content-type (serves .html as HTML)\nif grep -RInE --include='*.js' \\\n\
-        \  'express\\.static\\s*\\(\\s*[^)]*(upload|uploads|public)[^)]*\\)' \\\n\
-        \  src/server.js 2>/dev/null; then\n  echo \"::warning::express.static() mounted\
-        \ on an upload directory. Ensure a Content-Disposition: attachment / setHeaders\
-        \ hook blocks .html and .svg execution.\"\nfi\n\n# 4. Original filename used\
-        \ as filesystem path (path traversal)\nTRAV=$(grep -RInE --include='*.js'\
-        \ \\\n  '(req\\.file\\.originalname|file\\.originalname)\\s*\\)\\s*\\)\\]'\
-        \ \\\n  src/routes/upload.js 2>/dev/null | grep -E 'path\\.(join|resolve)'\
-        \ || true)\nif [ -n \"$TRAV\" ]; then\n  echo \"::error::req.file.originalname\
-        \ is fed directly into path.join/resolve \u2192 directory traversal:\"\n \
-        \ echo \"$TRAV\"\n  FAIL=1\nfi\n\n[ \"$FAIL\" -eq 0 ] && echo \"Multer configuration\
-        \ passes audit.\" || exit 1\n"
-    - name: semgrep-multer-file-upload
+    - name: Detect jwt.verify without algorithms and jwt.sign without expiresIn
       run: 'echo ''AI-designed Semgrep rule (id=ai-rule):''
 
         echo ''Rule body:''
@@ -237,31 +225,62 @@ jobs:
         SEMGREP_EOF
 
         '
-    - name: Convert multer-upload-audit shell_check annotations to SARIF
+    - name: Grep for unsafe jwt.verify and jwt.sign usage
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a sast.shell_log) 2>&1\n# Run the original script in a subshell with set\
+        \ +e so\n# that any single command failure does not abort the\n# script before\
+        \ it can emit a '::error' annotation.\ninner_exit=0\n( set +e\ncd \"$GITHUB_WORKSPACE\"\
+        \n\nFAIL=0\n\n# 1. Every jwt.verify must have algorithms pinned\nmapfile -t\
+        \ VERIFY_LINES < <(grep -RInE 'jwt\\.verify\\s*\\(' src/ 2>/dev/null || true)\n\
+        for line in \"${VERIFY_LINES[@]}\"; do\n  [ -z \"$line\" ] && continue\n \
+        \ file=\"$(echo \"$line\" | cut -d: -f1)\"\n  lineno=\"$(echo \"$line\" |\
+        \ cut -d: -f2)\"\n  # Inspect the next 3 lines for an algorithms option\n\
+        \  if ! sed -n \"${lineno},$((lineno+3))p\" \"$file\" | grep -qE 'algorithms\\\
+        s*:\\s*\\[?\\s*[\"\\x27]'; then\n    echo \"::error file=$file line=$lineno::jwt.verify()\
+        \ called without algorithms option (CWE-347)\"\n    FAIL=1\n  fi\ndone\n\n\
+        # 2. Every jwt.sign should have an expiresIn (or be a short-lived token: warn\
+        \ only)\nmapfile -t SIGN_LINES < <(grep -RInE 'jwt\\.sign\\s*\\(' src/ 2>/dev/null\
+        \ || true)\nfor line in \"${SIGN_LINES[@]}\"; do\n  [ -z \"$line\" ] && continue\n\
+        \  file=\"$(echo \"$line\" | cut -d: -f1)\"\n  lineno=\"$(echo \"$line\" |\
+        \ cut -d: -f2)\"\n  if ! sed -n \"${lineno},$((lineno+3))p\" \"$file\" | grep\
+        \ -qE 'expiresIn\\s*:'; then\n    echo \"::warning file=$file line=$lineno::jwt.sign()\
+        \ does not set expiresIn (CWE-613)\"\n    FAIL=1\n  fi\ndone\n\n# 3. Hard-coded\
+        \ fallback secrets\nif grep -RInE 'JWT_SECRET\\s*\\|\\|\\s*[\"\\x27][^\"\\\
+        x27]{1,32}[\"\\x27]' src/ 2>/dev/null; then\n  echo \"::error::Hard-coded\
+        \ fallback JWT_SECRET detected (CWE-798)\"\n  FAIL=1\nfi\n\nif [ \"$FAIL\"\
+        \ -ne 0 ]; then\n  echo \"JWT auth misconfiguration checks FAILED\"\n  exit\
+        \ 1\nfi\necho \"JWT usage looks properly configured.\"\n) || inner_exit=$?\n\
+        # If the inner script exited non-zero and emitted no\n# '::error'/'::warning'\
+        \ annotation, synthesise one so the\n# SARIF conversion step still has a finding\
+        \ to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)'\
+        \ sast.shell_log; then\n  echo \"::error file=Grep for unsafe jwt.verify and\
+        \ jwt.sign usage::shell check failed (exit code $inner_exit) \u2014 see run\
+        \ log for details\"\nfi\nexit $inner_exit\n"
+    - name: Convert sast shell_check annotations to SARIF
       if: always()
-      run: "cat > multer-upload-audit_annotations_to_sarif.py <<'PY_EOF'\nimport os,\
-        \ re, json\nlog_path = 'multer-upload-audit.shell_log'\nsarif_path = 'multer-upload-audit-results.sarif'\n\
-        tool_name = 'multer-upload-audit'\ntool_version = '1.0.0'\ninformation_uri\
-        \ = 'https://github.com/iqbalrsyd/ai-devsecops'\nrule_id_prefix = 'ai-devsecops-multer-upload-audit'\n\
-        results = []\nif os.path.exists(log_path):\n    pat = re.compile(r'^::(error|warning)(?:\
-        \ file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\d+))?::(.*)$')\n    for idx,\
-        \ line in enumerate(open(log_path, encoding='utf-8', errors='replace')):\n\
-        \        m = pat.match(line.rstrip('\\n'))\n        if not m:\n          \
-        \  continue\n        level, path, sl, el, msg = m.groups()\n        sl = int(sl)\
-        \ if sl else 1\n        el = int(el) if el else sl\n        if level == 'error':\n\
-        \            sarif_level = 'error'\n        else:\n            sarif_level\
-        \ = 'warning'\n        msg = msg.strip()\n        slug = re.sub(r'[^a-z0-9]+',\
-        \ '-', (msg or 'finding').lower())[:50].strip('-')\n        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n\
-        \        results.append({\n            'ruleId': rule_id,\n            'level':\
-        \ sarif_level,\n            'message': {'text': msg or '(no message)'},\n\
-        \            'locations': [{\n                'physicalLocation': {\n    \
-        \                'artifactLocation': {'uri': path or 'unknown'},\n       \
-        \             'region': {'startLine': sl, 'endLine': el},\n              \
-        \  },\n            }],\n        })\nexisting = {}\nif os.path.exists(sarif_path)\
-        \ and os.path.getsize(sarif_path) > 0:\n    try:\n        existing = json.load(open(sarif_path,\
-        \ encoding='utf-8'))\n    except Exception:\n        existing = {}\nif not\
-        \ existing or 'runs' not in existing or not existing['runs']:\n    existing\
-        \ = {\n        'version': '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+      run: "cat > sast_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\nlog_path\
+        \ = 'sast.shell_log'\nsarif_path = 'sast-results.sarif'\ntool_name = 'sast'\n\
+        tool_version = '1.0.0'\ninformation_uri = 'https://github.com/iqbalrsyd/ai-devsecops'\n\
+        rule_id_prefix = 'ai-devsecops-sast'\nresults = []\nif os.path.exists(log_path):\n\
+        \    pat = re.compile(r'^::(error|warning)(?: file=([^,]+))?(?:,line=(\\d+))?(?:,endLine=(\\\
+        d+))?::(.*)$')\n    for idx, line in enumerate(open(log_path, encoding='utf-8',\
+        \ errors='replace')):\n        m = pat.match(line.rstrip('\\n'))\n       \
+        \ if not m:\n            continue\n        level, path, sl, el, msg = m.groups()\n\
+        \        sl = int(sl) if sl else 1\n        el = int(el) if el else sl\n \
+        \       if level == 'error':\n            sarif_level = 'error'\n        else:\n\
+        \            sarif_level = 'warning'\n        msg = msg.strip()\n        slug\
+        \ = re.sub(r'[^a-z0-9]+', '-', (msg or 'finding').lower())[:50].strip('-')\n\
+        \        rule_id = f'{rule_id_prefix}-{slug}-{sl}-{idx}'\n        results.append({\n\
+        \            'ruleId': rule_id,\n            'level': sarif_level,\n     \
+        \       'message': {'text': msg or '(no message)'},\n            'locations':\
+        \ [{\n                'physicalLocation': {\n                    'artifactLocation':\
+        \ {'uri': path or 'unknown'},\n                    'region': {'startLine':\
+        \ sl, 'endLine': el},\n                },\n            }],\n        })\nexisting\
+        \ = {}\nif os.path.exists(sarif_path) and os.path.getsize(sarif_path) > 0:\n\
+        \    try:\n        existing = json.load(open(sarif_path, encoding='utf-8'))\n\
+        \    except Exception:\n        existing = {}\nif not existing or 'runs' not\
+        \ in existing or not existing['runs']:\n    existing = {\n        'version':\
+        \ '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
         \        'runs': [{\n            'tool': {'driver': {\n                'name':\
         \ tool_name, 'version': tool_version, 'informationUri': information_uri,\n\
         \            }},\n            'results': [],\n        }],\n    }\nexisting['runs'][0]['tool']['driver']['name']\
@@ -270,26 +289,25 @@ jobs:
         existing['runs'][0]['results'] = (existing['runs'][0].get('results') or [])\
         \ + results\nwith open(sarif_path, 'w', encoding='utf-8') as f:\n    json.dump(existing,\
         \ f, indent=2)\nprint(f'Wrote {len(results)} SARIF result(s) to {sarif_path}')\n\
-        PY_EOF\npython3 multer-upload-audit_annotations_to_sarif.py\n"
-    - name: Ensure multer-upload-audit-results.sarif exists (fallback for 0 findings)
+        PY_EOF\npython3 sast_annotations_to_sarif.py\n"
+    - name: Ensure sast-results.sarif exists (fallback for 0 findings)
       if: always()
-      run: "if [ ! -s multer-upload-audit-results.sarif ]; then\n  echo \"::notice::multer-upload-audit\
-        \ found 0 findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf\
-        \ '%s\\n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
+      run: "if [ ! -s sast-results.sarif ]; then\n  echo \"::notice::sast found 0\
+        \ findings. Generating empty SARIF to satisfy upload-sarif.\"\n  printf '%s\\\
+        n' \\\n    '{' \\\n    '  \"version\": \"2.1.0\",' \\\n    '  \"$schema\"\
         : \"https://json.schemastore.org/sarif-2.1.0.json\",' \\\n    '  \"runs\"\
         : [' \\\n    '    {' \\\n    '      \"tool\": {' \\\n    '        \"driver\"\
-        : {' \\\n    '          \"name\": \"multer-upload-audit\",' \\\n    '    \
-        \      \"version\": \"0.65.0\",' \\\n    '          \"informationUri\": \"\
-        https://aquasecurity.github.io/trivy/\"' \\\n    '        }' \\\n    '   \
-        \   },' \\\n    '      \"results\": []' \\\n    '    }' \\\n    '  ]' \\\n\
-        \    '}' > multer-upload-audit-results.sarif\nfi\necho \"\u2713 multer-upload-audit-results.sarif\
-        \ size: $(stat -c%s multer-upload-audit-results.sarif) bytes\"\n"
-    - name: Upload multer-upload-audit SARIF to GitHub Code Scanning
+        : {' \\\n    '          \"name\": \"sast\",' \\\n    '          \"version\"\
+        : \"0.65.0\",' \\\n    '          \"informationUri\": \"https://aquasecurity.github.io/trivy/\"\
+        ' \\\n    '        }' \\\n    '      },' \\\n    '      \"results\": []' \\\
+        \n    '    }' \\\n    '  ]' \\\n    '}' > sast-results.sarif\nfi\necho \"\u2713\
+        \ sast-results.sarif size: $(stat -c%s sast-results.sarif) bytes\"\n"
+    - name: Upload sast SARIF to GitHub Code Scanning
       if: always()
       uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
       with:
-        sarif_file: multer-upload-audit-results.sarif
-        category: multer-upload-audit
+        sarif_file: sast-results.sarif
+        category: sast
   blog-markdown-sanitize:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -300,14 +318,23 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-markdown-no-sanitize
-      run: "set -e\nexec > >(tee -a blog-markdown-xss.shell_log) 2>&1\nfail=0\n# Find\
-        \ marked() or markdown-it usage\nif grep -rnE 'marked\\s*\\(' src/ 2>/dev/null\
-        \ | grep -vE 'DOMPurify|sanitize' | grep -q .; then\n  echo '::error file=src/utils/markdown.js::marked()\
-        \ called without DOMPurify.sanitize \u2014 XSS via markdown'\n  fail=1\nfi\n\
-        # Find innerHTML with user content\nif grep -rnE 'innerHTML\\s*=\\s*\\$\\\
-        {?\\s*(content|post|comment|body)' src/ 2>/dev/null | grep -q .; then\n  echo\
-        \ '::error file=src/routes/posts.js::innerHTML assigned from user content\
-        \ \u2014 use textContent or DOMPurify'\n  fail=1\nfi\nexit $fail\n"
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a blog-markdown-xss.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        fail=0\n# Find marked() or markdown-it usage\nif grep -rnE 'marked\\s*\\('\
+        \ src/ 2>/dev/null | grep -vE 'DOMPurify|sanitize' | grep -q .; then\n  echo\
+        \ '::error file=src/utils/markdown.js::marked() called without DOMPurify.sanitize\
+        \ \u2014 XSS via markdown'\n  fail=1\nfi\n# Find innerHTML with user content\n\
+        if grep -rnE 'innerHTML\\s*=\\s*\\$\\{?\\s*(content|post|comment|body)' src/\
+        \ 2>/dev/null | grep -q .; then\n  echo '::error file=src/routes/posts.js::innerHTML\
+        \ assigned from user content \u2014 use textContent or DOMPurify'\n  fail=1\n\
+        fi\nexit $fail\n) || inner_exit=$?\n# If the inner script exited non-zero\
+        \ and emitted no\n# '::error'/'::warning' annotation, synthesise one so the\n\
+        # SARIF conversion step still has a finding to record.\nif [ \"$inner_exit\"\
+        \ -ne 0 ] && ! grep -qE '^::(error|warning)' blog-markdown-xss.shell_log;\
+        \ then\n  echo \"::error file=scan-markdown-no-sanitize::shell check failed\
+        \ (exit code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
     - name: Convert blog-markdown-xss shell_check annotations to SARIF
       if: always()
       run: "cat > blog-markdown-xss_annotations_to_sarif.py <<'PY_EOF'\nimport os,\
@@ -371,11 +398,19 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-comment-csrf-auth
-      run: "set -e\nexec > >(tee -a blog-csrf.shell_log) 2>&1\nfail=0\n# Check CSRF\
-        \ middleware present\nif ! grep -rnE '(csurf|csrf\\(\\)|doubleCsrf)' src/\
-        \ 2>/dev/null | grep -q .; then\n  echo '::warning file=src/server.js::No\
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a blog-csrf.shell_log) 2>&1\n# Run the original script in a subshell with\
+        \ set +e so\n# that any single command failure does not abort the\n# script\
+        \ before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\nfail=0\n\
+        # Check CSRF middleware present\nif ! grep -rnE '(csurf|csrf\\(\\)|doubleCsrf)'\
+        \ src/ 2>/dev/null | grep -q .; then\n  echo '::warning file=src/server.js::No\
         \ CSRF protection detected \u2014 install csurf or double-submit cookie pattern'\n\
-        \  fail=1\nfi\nexit $fail\n"
+        \  fail=1\nfi\nexit $fail\n) || inner_exit=$?\n# If the inner script exited\
+        \ non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' blog-csrf.shell_log;\
+        \ then\n  echo \"::error file=scan-comment-csrf-auth::shell check failed (exit\
+        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
     - name: Convert blog-csrf shell_check annotations to SARIF
       if: always()
       run: "cat > blog-csrf_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\n\
@@ -439,10 +474,19 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-csp-headers
-      run: "set -e\nexec > >(tee -a blog-csp.shell_log) 2>&1\nfail=0\n# Check helmet\
-        \ middleware\nif ! grep -rnE 'helmet\\s*\\(' src/ 2>/dev/null | grep -q .;\
-        \ then\n  echo '::warning file=src/server.js::helmet() middleware missing\
-        \ \u2014 CSP/HSTS/X-Frame-Options not set'\n  fail=1\nfi\nexit $fail\n"
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a blog-csp.shell_log) 2>&1\n# Run the original script in a subshell with\
+        \ set +e so\n# that any single command failure does not abort the\n# script\
+        \ before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\nfail=0\n\
+        # Check helmet middleware\nif ! grep -rnE 'helmet\\s*\\(' src/ 2>/dev/null\
+        \ | grep -q .; then\n  echo '::warning file=src/server.js::helmet() middleware\
+        \ missing \u2014 CSP/HSTS/X-Frame-Options not set'\n  fail=1\nfi\nexit $fail\n\
+        ) || inner_exit=$?\n# If the inner script exited non-zero and emitted no\n\
+        # '::error'/'::warning' annotation, synthesise one so the\n# SARIF conversion\
+        \ step still has a finding to record.\nif [ \"$inner_exit\" -ne 0 ] && ! grep\
+        \ -qE '^::(error|warning)' blog-csp.shell_log; then\n  echo \"::error file=scan-csp-headers::shell\
+        \ check failed (exit code $inner_exit) \u2014 see run log for details\"\n\
+        fi\nexit $inner_exit\n"
     - name: Convert blog-csp shell_check annotations to SARIF
       if: always()
       run: "cat > blog-csp_annotations_to_sarif.py <<'PY_EOF'\nimport os, re, json\n\
@@ -506,15 +550,23 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-multer-config
-      run: "set -e\nexec > >(tee -a blog-multer-hardening.shell_log) 2>&1\nfail=0\n\
-        # Check multer config: fileFilter present\nif grep -rnE \"multer\\s*\\(\"\
-        \ src/ 2>/dev/null | grep -q .; then\n  if ! grep -rnE 'fileFilter' src/ 2>/dev/null\
-        \ | grep -q .; then\n    echo '::error file=src/middleware/upload.js::multer()\
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a blog-multer-hardening.shell_log) 2>&1\n# Run the original script in a\
+        \ subshell with set +e so\n# that any single command failure does not abort\
+        \ the\n# script before it can emit a '::error' annotation.\ninner_exit=0\n\
+        ( set +e\nfail=0\n# Check multer config: fileFilter present\nif grep -rnE\
+        \ \"multer\\s*\\(\" src/ 2>/dev/null | grep -q .; then\n  if ! grep -rnE 'fileFilter'\
+        \ src/ 2>/dev/null | grep -q .; then\n    echo '::error file=src/middleware/upload.js::multer()\
         \ missing fileFilter \u2014 accepts any file type, risk of RCE via polyglot\
         \ file'\n    fail=1\n  fi\n  # Check size limit\n  if ! grep -rnE 'limits.*fileSize'\
         \ src/ 2>/dev/null | grep -q .; then\n    echo '::warning file=src/middleware/upload.js::multer()\
         \ missing limits.fileSize \u2014 no DoS protection on large uploads'\n   \
-        \ fail=1\n  fi\nfi\nexit $fail\n"
+        \ fail=1\n  fi\nfi\nexit $fail\n) || inner_exit=$?\n# If the inner script\
+        \ exited non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' blog-multer-hardening.shell_log;\
+        \ then\n  echo \"::error file=scan-multer-config::shell check failed (exit\
+        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
     - name: Convert blog-multer-hardening shell_check annotations to SARIF
       if: always()
       run: "cat > blog-multer-hardening_annotations_to_sarif.py <<'PY_EOF'\nimport\
@@ -579,14 +631,23 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-jwt-weak-secret
-      run: "set -e\nexec > >(tee -a blog-jwt-hardening.shell_log) 2>&1\nfail=0\n#\
-        \ JWT secret must come from env, not literal.\n# Use a double-quoted bash\
-        \ string so the regex\nif grep -rnE \"jwt\\.sign\\s*\\([^,]+,\\s*[\\\"'][A-Za-z0-9]{1,31}[\\\
-        \"']\" src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/auth/jwt.ts::JWT\
-        \ signed with short/hardcoded secret'\n  fail=1\nfi\n# 'none' algorithm forbidden\n\
-        if grep -rnE 'algorithm.*none|algorithms.*\\[.*none' src/ 2>/dev/null | grep\
-        \ -q .; then\n  echo '::error file=src/auth/jwt.ts::JWT verify accepts alg=none\
-        \ \u2014 algorithm confusion attack (CVE-2015-9235)'\n  fail=1\nfi\nexit $fail\n"
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a blog-jwt-hardening.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        fail=0\n# JWT secret must come from env, not literal.\n# Use a double-quoted\
+        \ bash string so the regex\nif grep -rnE \"jwt\\.sign\\s*\\([^,]+,\\s*[\\\"\
+        '][A-Za-z0-9]{1,31}[\\\"']\" src/ 2>/dev/null | grep -q .; then\n  echo '::error\
+        \ file=src/auth/jwt.ts::JWT signed with short/hardcoded secret'\n  fail=1\n\
+        fi\n# 'none' algorithm forbidden\nif grep -rnE 'algorithm.*none|algorithms.*\\\
+        [.*none' src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/auth/jwt.ts::JWT\
+        \ verify accepts alg=none \u2014 algorithm confusion attack (CVE-2015-9235)'\n\
+        \  fail=1\nfi\nexit $fail\n) || inner_exit=$?\n# If the inner script exited\
+        \ non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' blog-jwt-hardening.shell_log;\
+        \ then\n  echo \"::error file=scan-jwt-weak-secret::shell check failed (exit\
+        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
     - name: Convert blog-jwt-hardening shell_check annotations to SARIF
       if: always()
       run: "cat > blog-jwt-hardening_annotations_to_sarif.py <<'PY_EOF'\nimport os,\
@@ -650,12 +711,20 @@ jobs:
       with:
         persist-credentials: false
     - name: scan-open-redirect
-      run: "set -e\nexec > >(tee -a blog-open-redirect.shell_log) 2>&1\nfail=0\n#\
-        \ Look for direct res.redirect(req.query.*) without validation\nif grep -rnE\
-        \ 'res\\.redirect\\s*\\(\\s*req\\.query\\.(next|returnTo|redirect|url)' src/\
-        \ 2>/dev/null | grep -q .; then\n  echo '::error file=src/routes/auth.js::res.redirect\
+      run: "# Set up output capture for the annotation-to-SARIF step.\nexec > >(tee\
+        \ -a blog-open-redirect.shell_log) 2>&1\n# Run the original script in a subshell\
+        \ with set +e so\n# that any single command failure does not abort the\n#\
+        \ script before it can emit a '::error' annotation.\ninner_exit=0\n( set +e\n\
+        fail=0\n# Look for direct res.redirect(req.query.*) without validation\nif\
+        \ grep -rnE 'res\\.redirect\\s*\\(\\s*req\\.query\\.(next|returnTo|redirect|url)'\
+        \ src/ 2>/dev/null | grep -q .; then\n  echo '::error file=src/routes/auth.js::res.redirect\
         \ uses unvalidated user input \u2014 open-redirect phishing vector (CWE-601)'\n\
-        \  fail=1\nfi\nexit $fail\n"
+        \  fail=1\nfi\nexit $fail\n) || inner_exit=$?\n# If the inner script exited\
+        \ non-zero and emitted no\n# '::error'/'::warning' annotation, synthesise\
+        \ one so the\n# SARIF conversion step still has a finding to record.\nif [\
+        \ \"$inner_exit\" -ne 0 ] && ! grep -qE '^::(error|warning)' blog-open-redirect.shell_log;\
+        \ then\n  echo \"::error file=scan-open-redirect::shell check failed (exit\
+        \ code $inner_exit) \u2014 see run log for details\"\nfi\nexit $inner_exit\n"
     - name: Convert blog-open-redirect shell_check annotations to SARIF
       if: always()
       run: "cat > blog-open-redirect_annotations_to_sarif.py <<'PY_EOF'\nimport os,\
