@@ -67,10 +67,21 @@ jobs:
       with:
         persist-credentials: false
     - name: Run semgrep (registry + .semgrep/, SARIF output)
-      run: "docker run --rm \\\n  -v \"${{ github.workspace }}:/src\" \\\n  returntocorp/semgrep:1.99.0\
-        \ \\\n  semgrep ci \\\n    --config=.semgrep \\\n    --config=p/owasp-top-ten\
-        \ \\\n    --config=p/javascript \\\n    --config=p/nodejs \\\n    --config=p/secrets\
-        \ \\\n  --sarif --output=/src/semgrep-results.sarif \\\n  --timeout=600 --no-suppress-errors\n"
+      run: "# Ensure the `.semgrep/` directory exists before running.\n# The `--config=.semgrep`\
+        \ flag below imports any custom\n# rules committed by `pull_request_creation_node`;\
+        \ if the\n# directory is missing, semgrep returns exit 7 (config\n# error).\
+        \ Create an empty dir so the import is a no-op\n# rather than a hard failure.\n\
+        mkdir -p .semgrep\n# Only run semgrep if at least one registry config is\n\
+        # declared; otherwise the previous run already proved\n# the repo has no language\
+        \ that maps to a registry ruleset.\nif [ -z \"${{ env.SEMGREP_REGISTRY_CONFIGS\
+        \ }}\" ]; then\n  echo '::notice::No Semgrep registry configs selected for\
+        \ this language; writing empty SARIF.'\n  exit 0\nfi\ndocker run --rm \\\n\
+        \  -v \"${{ github.workspace }}:/src\" \\\n  returntocorp/semgrep:1.99.0 \\\
+        \n  semgrep ci \\\n    --config=.semgrep \\\n    --config=p/javascript \\\n\
+        \    --config=p/typescript \\\n    --config=p/nodejs \\\n    --config=p/expressjs\
+        \ \\\n    --config=p/react \\\n    --config=p/owasp-top-ten \\\n    --config=p/secrets\
+        \ \\\n    --config=p/security-audit \\\n  --sarif --output=/src/semgrep-results.sarif\
+        \ \\\n  --timeout=600 --no-suppress-errors\n"
       continue-on-error: true
     - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
       if: always()
@@ -135,7 +146,8 @@ jobs:
         scan-ref: .
         format: sarif
         output: trivy-fs-results.sarif
-        severity: HIGH,CRITICAL
+        version: v0.72.0
+        severity: MEDIUM,HIGH,CRITICAL
       continue-on-error: true
     - name: Ensure trivy-fs-results.sarif exists (fallback for 0 findings)
       if: always()
@@ -166,29 +178,55 @@ jobs:
         retention-days: 30
     - name: Convert npm audit JSON to SARIF
       if: always() && hashFiles('npm-audit-results.json') != ''
-      run: "python3 -c \"\nimport json, sys\ntry:\n    with open('npm-audit-results.json')\
-        \ as f:\n        data = json.load(f)\n    vulns = data.get('vulnerabilities',\
-        \ {})\n    results = []\n    for pkg, info in vulns.items():\n        if not\
-        \ info.get('via'):\n            continue\n        severity = info.get('severity','moderate')\n\
-        \        level = 'error' if severity in ('critical','high') else 'warning'\n\
-        \        seen_cves = set()\n        for via in info['via']:\n            if\
-        \ isinstance(via, dict):\n                cve_id = via.get('title','')\n \
-        \               if cve_id and cve_id not in seen_cves:\n                 \
-        \   seen_cves.add(cve_id)\n                    results.append({\n        \
-        \                'ruleId': cve_id,\n                        'message': {'text':\
-        \ cve_id + ' in ' + pkg + ' ' + info.get('range','')},\n                 \
-        \       'level': level,\n                        'locations': [{'physicalLocation':\
-        \ {'artifactLocation': {'uri': 'package.json'}}}],\n                     \
-        \   'properties': {'package': pkg, 'version': info.get('range',''), 'severity':\
-        \ severity}\n                    })\n    sarif = {\n        'version': '2.1.0',\n\
-        \        '\\$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n \
-        \       'runs': [{\n            'tool': {'driver': {'name': 'npm audit', 'version':\
-        \ '1.0', 'informationUri': 'https://docs.npmjs.com/cli/v10/commands/npm-audit'}},\n\
-        \            'results': results\n        }]\n    }\n    with open('npm-audit-results.sarif',\
+      run: "python3 << \"PY_EOF_NPM_AUDIT\"\nimport json, sys, re\ntry:\n    with\
+        \ open('npm-audit-results.json') as f:\n        data = json.load(f)\n    vulns\
+        \ = data.get('vulnerabilities', {})\n    results = []\n    cve_re = re.compile(r'CVE-\\\
+        d{4}-\\d{4,7}')\n    ghsa_re = re.compile(r'GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}')\n\
+        \    for pkg, info in vulns.items():\n        if not info.get('via'):\n  \
+        \          continue\n        severity = info.get('severity', 'moderate')\n\
+        \        level = 'error' if severity in ('critical', 'high') else 'warning'\n\
+        \        range_ = info.get('range', '')\n        for via in info['via']:\n\
+        \            if isinstance(via, str):\n                # String entry: transitive\
+        \ parent.\n                # The advisory is held in the original\n      \
+        \          # audit metadata; emit a finding keyed\n                # on (pkg,\
+        \ parent) so the dependency\n                # chain is visible.\n       \
+        \         rule_id = f'npm-audit:{pkg}->{via}'\n                message = f'Transitive\
+        \ vulnerability: {via} (parent) brings {pkg} ({range_}, {severity})'\n   \
+        \             results.append({\n                    'ruleId': rule_id,\n \
+        \                   'level': level,\n                    'message': {'text':\
+        \ message},\n                    'locations': [{'physicalLocation': {'artifactLocation':\
+        \ {'uri': 'package.json'}}}],\n                    'properties': {'package':\
+        \ pkg, 'parent': via, 'range': range_, 'severity': severity},\n          \
+        \      })\n            elif isinstance(via, dict):\n                title\
+        \ = via.get('title', '')\n                url = via.get('url', '')\n     \
+        \           # Prefer a stable CVE/GHSA id from\n                # the URL;\
+        \ fall back to title.\n                stable_id = ''\n                for\
+        \ src in (url, title):\n                    m = cve_re.search(src) or ghsa_re.search(src)\n\
+        \                    if m:\n                        stable_id = m.group(0)\n\
+        \                        break\n                rule_id = stable_id or title\
+        \ or f'npm-audit:{pkg}'\n                if stable_id:\n                 \
+        \   message = f'{title} in {pkg} {range_} (severity={severity}) \u2014 {stable_id}'\n\
+        \                else:\n                    message = f'{title or \"Vulnerability\"\
+        } in {pkg} {range_} (severity={severity})'\n                results.append({\n\
+        \                    'ruleId': rule_id,\n                    'level': level,\n\
+        \                    'message': {'text': message},\n                    'locations':\
+        \ [{'physicalLocation': {'artifactLocation': {'uri': 'package.json'}}}],\n\
+        \                    'properties': {\n                        'package': pkg,\n\
+        \                        'range': range_,\n                        'severity':\
+        \ severity,\n                        'title': title,\n                   \
+        \     'url': url,\n                        'source': via.get('source'),\n\
+        \                        'cwe': via.get('cwe', []),\n                    \
+        \    'cvss_score': via.get('cvss', {}).get('score') if isinstance(via.get('cvss'),\
+        \ dict) else None,\n                    },\n                })\n    sarif\
+        \ = {\n        'version': '2.1.0',\n        '$schema': 'https://json.schemastore.org/sarif-2.1.0.json',\n\
+        \        'runs': [{\n            'tool': {'driver': {'name': 'npm audit',\
+        \ 'version': '1.0', 'informationUri': 'https://docs.npmjs.com/cli/v10/commands/npm-audit'}},\n\
+        \            'results': results,\n        }],\n    }\n    with open('npm-audit-results.sarif',\
         \ 'w') as f:\n        json.dump(sarif, f, indent=2)\n    print(f'npm-audit-results.sarif\
-        \ written with {len(results)} findings')\nexcept Exception as e:\n    print(f'npm-audit\
-        \ SARIF conversion error: {e}', file=sys.stderr)\n    import traceback; traceback.print_exc()\n\
-        \    sys.exit(0)\n\"\n"
+        \ written with {len(results)} findings from {len(vulns)} vulnerable packages')\n\
+        except Exception as e:\n    print(f'npm-audit SARIF conversion error: {e}',\
+        \ file=sys.stderr)\n    import traceback; traceback.print_exc()\n    sys.exit(0)\n\
+        PY_EOF_NPM_AUDIT\n"
       continue-on-error: true
     - name: Ensure npm-audit-results.sarif exists (fallback for 0 findings)
       if: always()
