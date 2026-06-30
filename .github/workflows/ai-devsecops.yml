@@ -15,7 +15,6 @@ permissions:
   contents: read
   pull-requests: read
   security-events: write
-  actions: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -71,8 +70,7 @@ jobs:
       run: "docker run --rm \\\n  -v \"${{ github.workspace }}:/src\" \\\n  returntocorp/semgrep:1.99.0\
         \ \\\n  semgrep ci \\\n    --config=.semgrep \\\n    --config=p/owasp-top-ten\
         \ \\\n    --config=p/javascript \\\n    --config=p/nodejs \\\n    --config=p/secrets\
-        \ \\\n  --sarif --output=/src/semgrep-results.sarif \\\n  --timeout=600 --no-error\
-        \ --error\n"
+        \ \\\n  --sarif --output=/src/semgrep-results.sarif \\\n  --timeout=600 --no-suppress-errors\n"
       continue-on-error: true
     - name: Ensure Semgrep SARIF file exists (fallback for 0 findings or scan error)
       if: always()
